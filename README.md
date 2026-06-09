@@ -48,6 +48,9 @@ use pnpm rather than npm or Yarn.
 The injected agent guidance is maintained in
 [`instructions/agent.md`](instructions/agent.md). Edit that template to change
 the shared Claude and Codex instructions, then rebuild and reinstall the CLI.
+The guidance explains that the agent is inside a restricted container, may not
+have Docker or running project services, must validate migration targets, and
+must leave Git publishing operations to the host.
 
 At container startup, the runtime checks npm for newer Claude Code and Codex
 versions. Registry failures do not prevent startup, and each query times out
@@ -72,6 +75,21 @@ you use a custom image.
 When loading an existing config, Agentbox warns about missing current options,
 unknown options, and recognized deprecated names. Missing options continue
 using their built-in defaults, so compatible older configs still run.
+
+Workspace mounts are restricted to the repository root or one of its
+subdirectories, including after resolving symlinks. `doctor` and `explain`
+redact sensitive environment values from displayed Docker commands.
+
+In Compose mode, Agentbox selects the default network or the sole network used
+by project services. Set `network.compose_network` to a Compose network key or
+resolved Docker network name when a project uses multiple networks. Agent runs
+verify that the selected network exists and otherwise direct you to run
+`agentbox up`.
+
+```toml
+[network]
+compose_network = "backend"
+```
 
 Only variables listed in `[env].allow` or `[env.defaults]`, plus values from
 the configured project-local env file, enter the container. Sensitive names

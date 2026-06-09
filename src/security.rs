@@ -47,14 +47,24 @@ pub fn validate_config(config: &Config) -> Result<()> {
 }
 
 pub fn resolve_workspace(repo_root: &Path, mount: &Path) -> Result<PathBuf> {
+    let canonical_repo = fs::canonicalize(repo_root)
+        .with_context(|| format!("failed to resolve repository root {}", repo_root.display()))?;
     let path = if mount.is_absolute() {
         mount.to_path_buf()
     } else {
-        repo_root.join(mount)
+        canonical_repo.join(mount)
     };
     let canonical = fs::canonicalize(&path)
         .with_context(|| format!("workspace mount does not exist: {}", path.display()))?;
     validate_workspace_path(&canonical)?;
+    if !canonical.starts_with(&canonical_repo) {
+        anyhow::bail!(
+            "workspace mount {} is outside repository {}; only the repository or one of its \
+             subdirectories may be mounted",
+            canonical.display(),
+            canonical_repo.display()
+        );
+    }
     Ok(canonical)
 }
 
@@ -118,7 +128,7 @@ pub fn collect_environment(
     Ok(values)
 }
 
-fn is_sensitive(name: &str) -> bool {
+pub(crate) fn is_sensitive(name: &str) -> bool {
     SENSITIVE_ENV_VARS.contains(&name)
         || name.ends_with("_TOKEN")
         || name.ends_with("_PASSWORD")
@@ -168,6 +178,31 @@ mod tests {
     #[test]
     fn rejects_root_mount() {
         assert!(validate_workspace_path(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn workspace_must_be_inside_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        assert!(resolve_workspace(repo.path(), outside.path()).is_err());
+
+        let nested = repo.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        assert_eq!(
+            resolve_workspace(repo.path(), Path::new("nested")).unwrap(),
+            nested
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_symlink_cannot_escape_repository() {
+        use std::os::unix::fs::symlink;
+
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), repo.path().join("escape")).unwrap();
+        assert!(resolve_workspace(repo.path(), Path::new("escape")).is_err());
     }
 
     #[test]

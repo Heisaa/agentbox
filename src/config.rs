@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_DIR: &str = ".agentbox";
 pub const CONFIG_FILE: &str = ".agentbox/config.toml";
 const DYNAMIC_TABLES: &[&str] = &["env.defaults"];
-const DEPRECATED_KEYS: &[(&str, &str)] = &[
-    ("agent.allow_git_write", "security.allow_git_mutation"),
-    ("agent.allow_network", "network.internet"),
-    ("project.workdir", "workspace.container_path"),
-    ("project.mount", "workspace.mount"),
+const DEPRECATED_KEYS: &[(&str, Option<&str>)] = &[
+    ("agent.allow_git_write", None),
+    ("agent.allow_network", Some("network.internet")),
+    ("project.workdir", Some("workspace.container_path")),
+    ("project.mount", Some("workspace.mount")),
+    ("security.allow_git_mutation", None),
+    ("network.auto_detect_project", None),
 ];
 
 #[derive(Debug)]
@@ -67,7 +69,6 @@ pub struct SecurityConfig {
     pub mount_docker_socket: bool,
     pub pass_ssh_agent: bool,
     pub allow_host_network: bool,
-    pub allow_git_mutation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +76,7 @@ pub struct SecurityConfig {
 pub struct NetworkConfig {
     pub mode: NetworkMode,
     pub compose_files: Vec<PathBuf>,
-    pub auto_detect_project: bool,
+    pub compose_network: String,
     pub internet: bool,
 }
 
@@ -159,7 +160,7 @@ impl Default for NetworkConfig {
         Self {
             mode: NetworkMode::Compose,
             compose_files: Vec::new(),
-            auto_detect_project: true,
+            compose_network: String::new(),
             internet: true,
         }
     }
@@ -284,9 +285,13 @@ fn compare_schema(
             .iter()
             .find(|(deprecated, _)| *deprecated == key_path)
         {
-            warnings.push(format!(
-                "deprecated `{key_path}` is ignored; use `{replacement}` instead"
-            ));
+            let message = match replacement {
+                Some(replacement) => {
+                    format!("deprecated `{key_path}` is ignored; use `{replacement}` instead")
+                }
+                None => format!("deprecated `{key_path}` is ignored and has no replacement"),
+            };
+            warnings.push(message);
         } else {
             warnings.push(format!("unknown `{key_path}` is ignored"));
         }
@@ -316,6 +321,7 @@ mod tests {
     #[test]
     fn default_config_round_trips() {
         let encoded = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(encoded.contains("compose_network = \"\""));
         let decoded: Config = toml::from_str(&encoded).unwrap();
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.workspace.container_path, "/workspace");
@@ -370,6 +376,23 @@ mod tests {
         compare_schema("", &raw, &expected, &mut warnings);
         assert!(warnings.iter().any(|warning| {
             warning == "deprecated `agent.allow_network` is ignored; use `network.internet` instead"
+        }));
+    }
+
+    #[test]
+    fn removed_options_warn_without_claiming_to_work() {
+        let raw: toml::Value = toml::from_str(
+            "[security]\nallow_git_mutation = false\n\n[network]\nauto_detect_project = true\n",
+        )
+        .unwrap();
+        let expected = toml::Value::try_from(Config::default()).unwrap();
+        let mut warnings = Vec::new();
+        compare_schema("", &raw, &expected, &mut warnings);
+        assert!(warnings.iter().any(|warning| {
+            warning == "deprecated `security.allow_git_mutation` is ignored and has no replacement"
+        }));
+        assert!(warnings.iter().any(|warning| {
+            warning == "deprecated `network.auto_detect_project` is ignored and has no replacement"
         }));
     }
 }

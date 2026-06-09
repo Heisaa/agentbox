@@ -144,7 +144,12 @@ fn load_context(inspect_compose: bool) -> Result<AppContext> {
         config.network.compose_files.clone()
     };
     let compose = if inspect_compose && config.network.mode == NetworkMode::Compose {
-        compose::inspect(&repo_root, &compose_files)?
+        compose::inspect(
+            &repo_root,
+            &compose_files,
+            (!config.network.compose_network.is_empty())
+                .then_some(config.network.compose_network.as_str()),
+        )?
     } else {
         None
     };
@@ -168,6 +173,7 @@ fn run_agent(args: &RunArgs, explain: bool) -> Result<u8> {
         Ok(0)
     } else {
         ensure_docker_available()?;
+        ensure_compose_network(&context)?;
         docker::execute(&spec)
     }
 }
@@ -178,6 +184,7 @@ fn run_shell(args: &SandboxArgs) -> Result<u8> {
     let spec = build_spec(&context, &args.allow_secrets, shell, true)?;
     print_banner(&context, &spec);
     ensure_docker_available()?;
+    ensure_compose_network(&context)?;
     docker::execute(&spec)
 }
 
@@ -207,6 +214,20 @@ fn doctor(args: &SandboxArgs) -> Result<u8> {
     );
     if let Some(compose) = &context.compose {
         println!("- Compose project: {}", compose.name);
+        println!(
+            "- Compose network: {} ({})",
+            compose.network,
+            command_health(
+                "docker",
+                &[
+                    "network",
+                    "inspect",
+                    "--format",
+                    "{{.Name}}",
+                    &compose.network,
+                ],
+            )
+        );
         println!(
             "- Services: {}",
             if compose.services.is_empty() {
@@ -310,9 +331,8 @@ fn project_guidance(tools: &ProjectTools) -> String {
     AGENT_INSTRUCTIONS
         .replace(PACKAGE_MANAGER_PLACEHOLDER, &package_manager)
         .replace(RUST_PLACEHOLDER, &rust)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .trim()
+        .to_owned()
 }
 
 fn print_banner(context: &AppContext, spec: &RunSpec) {
@@ -375,6 +395,15 @@ fn ensure_docker_available() -> Result<()> {
     Ok(())
 }
 
+fn ensure_compose_network(context: &AppContext) -> Result<()> {
+    if context.config.network.mode == NetworkMode::Compose
+        && let Some(compose) = &context.compose
+    {
+        compose::ensure_network_exists(&compose.network)?;
+    }
+    Ok(())
+}
+
 fn command_health(program: &str, args: &[&str]) -> String {
     match Command::new(program).args(args).output() {
         Ok(output) if output.status.success() => {
@@ -416,7 +445,8 @@ mod tests {
         assert_eq!(command[0], "codex");
         assert_eq!(command[1], "--dangerously-bypass-approvals-and-sandbox");
         assert_eq!(command[2], "-c");
-        assert!(command[3].contains("Verify changes"));
+        assert!(command[3].contains("# Agentbox environment"));
+        assert!(command[3].contains("database migrations"));
     }
 
     #[test]
@@ -453,5 +483,7 @@ mod tests {
         assert!(!guidance.contains("{{"));
         assert!(guidance.contains("uses pnpm"));
         assert!(guidance.contains("cargo clippy"));
+        assert!(guidance.contains("\n## Environment limitations\n"));
+        assert!(guidance.contains("Docker and Docker Compose may be unavailable"));
     }
 }

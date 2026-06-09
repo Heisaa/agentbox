@@ -176,11 +176,34 @@ pub fn execute(spec: &RunSpec) -> Result<u8> {
 }
 
 pub fn format_command(spec: &RunSpec) -> String {
-    std::iter::once(OsStr::new("docker"))
-        .chain(spec.args.iter().map(OsString::as_os_str))
+    let mut redact_next_env = false;
+    std::iter::once(OsString::from("docker"))
+        .chain(spec.args.iter().cloned())
+        .map(|arg| {
+            if redact_next_env {
+                redact_next_env = false;
+                return redact_environment(&arg);
+            }
+            if arg == OsStr::new("--env") {
+                redact_next_env = true;
+            }
+            arg
+        })
         .map(|arg| shell_words::quote(&arg.to_string_lossy()).into_owned())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn redact_environment(argument: &OsStr) -> OsString {
+    let rendered = argument.to_string_lossy();
+    let Some((name, _)) = rendered.split_once('=') else {
+        return argument.to_owned();
+    };
+    if crate::security::is_sensitive(name) {
+        OsString::from(format!("{name}=<redacted>"))
+    } else {
+        argument.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -228,5 +251,35 @@ mod tests {
         })
         .unwrap();
         assert!(format_command(&spec).contains(",readonly"));
+    }
+
+    #[test]
+    fn displayed_command_redacts_sensitive_environment_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let environment = BTreeMap::from([
+            ("NODE_ENV".into(), "development".into()),
+            ("OPENAI_API_KEY".into(), "super-secret-value".into()),
+        ]);
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            compose: None,
+            environment,
+            command: vec!["true".into()],
+            interactive: false,
+        })
+        .unwrap();
+
+        let rendered = format_command(&spec);
+        assert!(rendered.contains("NODE_ENV=development"));
+        assert!(rendered.contains("OPENAI_API_KEY=<redacted>"));
+        assert!(!rendered.contains("super-secret-value"));
+        assert!(
+            spec.args
+                .iter()
+                .any(|argument| argument == "OPENAI_API_KEY=super-secret-value")
+        );
     }
 }

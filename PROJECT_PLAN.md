@@ -748,12 +748,11 @@ mount_host_home = false
 mount_docker_socket = false
 pass_ssh_agent = false
 allow_host_network = false
-allow_git_mutation = false
 
 [network]
 mode = "compose"
 compose_files = ["docker-compose.yml"]
-auto_detect_project = true
+compose_network = "default"
 internet = true
 
 [env]
@@ -872,4 +871,3 @@ and get an agent that can:
 * leave Git review and commits to the human.
 
 The ideal experience should feel almost as convenient as running the agent directly on the host, but with a much smaller blast radius.
-
