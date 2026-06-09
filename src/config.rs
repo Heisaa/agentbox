@@ -1,0 +1,375 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+pub const CONFIG_DIR: &str = ".agentbox";
+pub const CONFIG_FILE: &str = ".agentbox/config.toml";
+const DYNAMIC_TABLES: &[&str] = &["env.defaults"];
+const DEPRECATED_KEYS: &[(&str, &str)] = &[
+    ("agent.allow_git_write", "security.allow_git_mutation"),
+    ("agent.allow_network", "network.internet"),
+    ("project.workdir", "workspace.container_path"),
+    ("project.mount", "workspace.mount"),
+];
+
+#[derive(Debug)]
+pub struct LoadedConfig {
+    pub config: Config,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub version: u32,
+    pub workspace: WorkspaceConfig,
+    pub agent: AgentConfig,
+    pub security: SecurityConfig,
+    pub network: NetworkConfig,
+    pub env: EnvConfig,
+    pub caches: CacheConfig,
+    pub limits: LimitsConfig,
+    pub runtime: RuntimeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub mount: PathBuf,
+    pub container_path: String,
+    pub write: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub default: String,
+    pub command: String,
+    pub home: HomeMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HomeMode {
+    #[default]
+    Persistent,
+    Ephemeral,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    pub mount_host_home: bool,
+    pub mount_docker_socket: bool,
+    pub pass_ssh_agent: bool,
+    pub allow_host_network: bool,
+    pub allow_git_mutation: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    pub mode: NetworkMode,
+    pub compose_files: Vec<PathBuf>,
+    pub auto_detect_project: bool,
+    pub internet: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    #[default]
+    Compose,
+    Bridge,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvConfig {
+    pub allow: Vec<String>,
+    pub defaults: toml::Table,
+    pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CacheConfig {
+    pub npm: bool,
+    pub pnpm: bool,
+    pub cargo: bool,
+    pub pip: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    pub cpus: f32,
+    pub memory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    pub image: String,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            workspace: WorkspaceConfig::default(),
+            agent: AgentConfig::default(),
+            security: SecurityConfig::default(),
+            network: NetworkConfig::default(),
+            env: EnvConfig::default(),
+            caches: CacheConfig::default(),
+            limits: LimitsConfig::default(),
+            runtime: RuntimeConfig::default(),
+        }
+    }
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            mount: PathBuf::from("."),
+            container_path: "/workspace".into(),
+            write: true,
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            default: "claude".into(),
+            command: "claude --permission-mode acceptEdits".into(),
+            home: HomeMode::Persistent,
+        }
+    }
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            mode: NetworkMode::Compose,
+            compose_files: Vec::new(),
+            auto_detect_project: true,
+            internet: true,
+        }
+    }
+}
+
+impl Default for EnvConfig {
+    fn default() -> Self {
+        let mut defaults = toml::Table::new();
+        defaults.insert("NODE_ENV".into(), toml::Value::String("development".into()));
+        Self {
+            allow: vec!["NODE_ENV".into(), "RUST_LOG".into()],
+            defaults,
+            file: Some(PathBuf::from(".agentbox/env")),
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            npm: true,
+            pnpm: true,
+            cargo: true,
+            pip: true,
+        }
+    }
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            cpus: 4.0,
+            memory: "8g".into(),
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            image: "agentbox/fullstack:latest".into(),
+        }
+    }
+}
+
+impl Config {
+    pub fn load(repo_root: &Path) -> Result<LoadedConfig> {
+        let path = repo_root.join(CONFIG_FILE);
+        if !path.exists() {
+            return Ok(LoadedConfig {
+                config: Self::default(),
+                warnings: Vec::new(),
+            });
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let raw: toml::Value =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        let config: Self =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        if config.version != 1 {
+            anyhow::bail!(
+                "unsupported config version {} in {}; expected 1",
+                config.version,
+                path.display()
+            );
+        }
+        let expected =
+            toml::Value::try_from(Self::default()).context("failed to build config schema")?;
+        let mut warnings = Vec::new();
+        compare_schema("", &raw, &expected, &mut warnings);
+        Ok(LoadedConfig { config, warnings })
+    }
+
+    pub fn write_new(&self, repo_root: &Path) -> Result<PathBuf> {
+        let directory = repo_root.join(CONFIG_DIR);
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+        let path = repo_root.join(CONFIG_FILE);
+        if path.exists() {
+            anyhow::bail!("{} already exists", path.display());
+        }
+        let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
+        fs::write(&path, contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+fn compare_schema(
+    path: &str,
+    actual: &toml::Value,
+    expected: &toml::Value,
+    warnings: &mut Vec<String>,
+) {
+    let (Some(actual), Some(expected)) = (actual.as_table(), expected.as_table()) else {
+        return;
+    };
+
+    for (key, expected_value) in expected {
+        let key_path = join_path(path, key);
+        match actual.get(key) {
+            None => warnings.push(format!(
+                "missing `{key_path}`; using default {}",
+                display_default(expected_value)
+            )),
+            Some(actual_value) if expected_value.is_table() && actual_value.is_table() => {
+                if !DYNAMIC_TABLES.contains(&key_path.as_str()) {
+                    compare_schema(&key_path, actual_value, expected_value, warnings);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+
+    for key in actual.keys() {
+        if expected.contains_key(key) {
+            continue;
+        }
+        let key_path = join_path(path, key);
+        if let Some((_, replacement)) = DEPRECATED_KEYS
+            .iter()
+            .find(|(deprecated, _)| *deprecated == key_path)
+        {
+            warnings.push(format!(
+                "deprecated `{key_path}` is ignored; use `{replacement}` instead"
+            ));
+        } else {
+            warnings.push(format!("unknown `{key_path}` is ignored"));
+        }
+    }
+}
+
+fn join_path(parent: &str, key: &str) -> String {
+    if parent.is_empty() {
+        key.to_owned()
+    } else {
+        format!("{parent}.{key}")
+    }
+}
+
+fn display_default(value: &toml::Value) -> String {
+    if value.is_table() {
+        "the built-in section defaults".into()
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_round_trips() {
+        let encoded = toml::to_string_pretty(&Config::default()).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.workspace.container_path, "/workspace");
+        assert!(!decoded.security.mount_host_home);
+    }
+
+    #[test]
+    fn warns_for_missing_and_unknown_options() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(CONFIG_DIR);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            temp.path().join(CONFIG_FILE),
+            "version = 1\nmystery = true\n\n[workspace]\nmount = \".\"\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load(temp.path()).unwrap();
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("missing `workspace.container_path`"))
+        );
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|warning| warning == "unknown `mystery` is ignored")
+        );
+    }
+
+    #[test]
+    fn allows_dynamic_environment_defaults() {
+        let raw: toml::Value =
+            toml::from_str("[env.defaults]\nCUSTOM_PROJECT_VALUE = \"yes\"\n").unwrap();
+        let expected = toml::Value::try_from(Config::default()).unwrap();
+        let mut warnings = Vec::new();
+        compare_schema("", &raw, &expected, &mut warnings);
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("CUSTOM_PROJECT_VALUE"))
+        );
+    }
+
+    #[test]
+    fn deprecated_option_names_include_replacement() {
+        let raw: toml::Value = toml::from_str("[agent]\nallow_network = true\n").unwrap();
+        let expected = toml::Value::try_from(Config::default()).unwrap();
+        let mut warnings = Vec::new();
+        compare_schema("", &raw, &expected, &mut warnings);
+        assert!(warnings.iter().any(|warning| {
+            warning == "deprecated `agent.allow_network` is ignored; use `network.internet` instead"
+        }));
+    }
+}
