@@ -6,7 +6,23 @@ socket. The included full-stack image provides Claude Code, Codex, Node.js 24,
 pnpm, Rust/Cargo, Python, PostgreSQL and Redis clients, native build tools, and
 common command-line development tools.
 
-## Build
+## Install
+
+Build the runtime image and install the CLI:
+
+```bash
+./install.sh
+```
+
+The installer uses `agentbox/fullstack:latest` by default. Override the image
+tag with `AGENTBOX_IMAGE`. If Cargo's bin directory is not in `PATH`, the
+installer prints the command needed to add it.
+
+```bash
+AGENTBOX_IMAGE=agentbox/fullstack:dev ./install.sh
+```
+
+## Manual Build
 
 ```bash
 cargo build --release
