@@ -149,7 +149,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             default: "claude".into(),
-            command: "claude --permission-mode acceptEdits".into(),
+            command: "claude".into(),
             home: HomeMode::Persistent,
         }
     }

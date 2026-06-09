@@ -50,10 +50,11 @@ agentbox down
 ```
 
 Running `agentbox` without a subcommand starts the configured default agent.
-For Claude, the generated default is `--permission-mode acceptEdits`: file
-edits are accepted automatically while riskier operations may still prompt. Codex
-is launched with `--dangerously-bypass-approvals-and-sandbox` because Agentbox
-itself provides the external container sandbox.
+Direct Claude commands are launched with `--dangerously-skip-permissions`, and
+direct Codex commands use `--dangerously-bypass-approvals-and-sandbox`.
+Agentbox provides the external container boundary, so the agents do not add
+nested approval prompts or sandboxes. Custom wrapper executables are left
+unchanged.
 
 Agentbox detects Rust projects and JavaScript package managers from common
 manifest and lock files. Claude and Codex receive instructions to run relevant

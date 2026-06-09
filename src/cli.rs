@@ -283,12 +283,9 @@ fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Resul
         None if !config.agent.command.is_empty() => config.agent.command.clone(),
         None => config.agent.default.clone(),
     };
-    let is_plain_codex = executable == "codex";
     let mut command =
         shell_words::split(&executable).context("agent command contains invalid shell quoting")?;
-    if is_plain_codex {
-        command.push("--dangerously-bypass-approvals-and-sandbox".into());
-    }
+    apply_agentbox_permissions(&mut command);
     let guidance = project_guidance(tools);
     match command.first().map(String::as_str) {
         Some("claude") => {
@@ -306,6 +303,40 @@ fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Resul
         anyhow::bail!("agent command is empty");
     }
     Ok(command)
+}
+
+fn apply_agentbox_permissions(command: &mut Vec<String>) {
+    match command.first().map(String::as_str) {
+        Some("claude") => {
+            let mut index = 1;
+            while index < command.len() {
+                if command[index] == "--permission-mode" {
+                    command.remove(index);
+                    if index < command.len() {
+                        command.remove(index);
+                    }
+                } else if command[index].starts_with("--permission-mode=") {
+                    command.remove(index);
+                } else {
+                    index += 1;
+                }
+            }
+            if !command
+                .iter()
+                .any(|argument| argument == "--dangerously-skip-permissions")
+            {
+                command.push("--dangerously-skip-permissions".into());
+            }
+        }
+        Some("codex")
+            if !command
+                .iter()
+                .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox") =>
+        {
+            command.push("--dangerously-bypass-approvals-and-sandbox".into());
+        }
+        _ => {}
+    }
 }
 
 fn project_guidance(tools: &ProjectTools) -> String {
@@ -447,6 +478,72 @@ mod tests {
         assert_eq!(command[2], "-c");
         assert!(command[3].contains("# Agentbox environment"));
         assert!(command[3].contains("database migrations"));
+    }
+
+    #[test]
+    fn claude_profile_skips_permissions() {
+        let args = RunArgs {
+            agent: Some("claude".into()),
+            ..RunArgs::default()
+        };
+
+        let command = agent_command(&Config::default(), &args, &ProjectTools::default()).unwrap();
+        assert_eq!(command[0], "claude");
+        assert_eq!(command[1], "--dangerously-skip-permissions");
+        assert_eq!(command[2], "--append-system-prompt");
+    }
+
+    #[test]
+    fn legacy_claude_permission_mode_is_replaced() {
+        let mut config = Config::default();
+        config.agent.command = "claude --permission-mode acceptEdits".into();
+
+        let command =
+            agent_command(&config, &RunArgs::default(), &ProjectTools::default()).unwrap();
+        assert!(command.contains(&"--dangerously-skip-permissions".into()));
+        assert!(
+            !command
+                .iter()
+                .any(|argument| argument == "--permission-mode")
+        );
+        assert!(!command.iter().any(|argument| argument == "acceptEdits"));
+    }
+
+    #[test]
+    fn permission_flags_are_not_duplicated() {
+        let mut config = Config::default();
+        config.agent.command = "claude --dangerously-skip-permissions".into();
+        let claude = agent_command(&config, &RunArgs::default(), &ProjectTools::default()).unwrap();
+        assert_eq!(
+            claude
+                .iter()
+                .filter(|argument| *argument == "--dangerously-skip-permissions")
+                .count(),
+            1
+        );
+
+        let args = RunArgs {
+            agent: Some("codex --dangerously-bypass-approvals-and-sandbox".into()),
+            ..RunArgs::default()
+        };
+        let codex = agent_command(&config, &args, &ProjectTools::default()).unwrap();
+        assert_eq!(
+            codex
+                .iter()
+                .filter(|argument| *argument == "--dangerously-bypass-approvals-and-sandbox")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn custom_agent_wrappers_are_not_modified() {
+        let args = RunArgs {
+            agent: Some("my-agent-wrapper claude".into()),
+            ..RunArgs::default()
+        };
+        let command = agent_command(&Config::default(), &args, &ProjectTools::default()).unwrap();
+        assert_eq!(command, ["my-agent-wrapper", "claude"]);
     }
 
     #[test]

@@ -4,6 +4,10 @@ You are running inside Agentbox, a Docker container with the project repository
 mounted as your workspace. Treat the container as an isolated development
 environment, not as the developer's host machine.
 
+Agent-level permission prompts and nested sandboxes may be disabled because
+Agentbox provides the external container boundary. This does not remove the
+limitations or safety requirements below.
+
 ## Environment limitations
 
 - The repository is writable, so your file changes are immediately visible on
