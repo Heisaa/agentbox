@@ -30,6 +30,8 @@ pub struct Config {
     pub version: u32,
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
+    pub caveman: CavemanConfig,
+    pub headroom: HeadroomConfig,
     pub security: SecurityConfig,
     pub network: NetworkConfig,
     pub env: EnvConfig,
@@ -52,6 +54,42 @@ pub struct AgentConfig {
     pub default: String,
     pub command: String,
     pub home: HomeMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CavemanConfig {
+    pub enabled: bool,
+    pub level: CavemanLevel,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CavemanLevel {
+    Lite,
+    #[default]
+    Full,
+    Ultra,
+    Wenyan,
+}
+
+impl CavemanLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Lite => "lite",
+            Self::Full => "full",
+            Self::Ultra => "ultra",
+            Self::Wenyan => "wenyan",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeadroomConfig {
+    pub enabled: bool,
+    pub service: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +155,7 @@ pub struct LimitsConfig {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub image: String,
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -125,6 +164,8 @@ impl Default for Config {
             version: 1,
             workspace: WorkspaceConfig::default(),
             agent: AgentConfig::default(),
+            caveman: CavemanConfig::default(),
+            headroom: HeadroomConfig::default(),
             security: SecurityConfig::default(),
             network: NetworkConfig::default(),
             env: EnvConfig::default(),
@@ -151,6 +192,25 @@ impl Default for AgentConfig {
             default: "claude".into(),
             command: "claude".into(),
             home: HomeMode::Persistent,
+        }
+    }
+}
+
+impl Default for CavemanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            level: CavemanLevel::Full,
+        }
+    }
+}
+
+impl Default for HeadroomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service: "headroom".into(),
+            url: "http://headroom:8787".into(),
         }
     }
 }
@@ -202,6 +262,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             image: "agentbox/fullstack:latest".into(),
+            auto_update: true,
         }
     }
 }
@@ -326,6 +387,11 @@ mod tests {
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.workspace.container_path, "/workspace");
         assert!(!decoded.security.mount_host_home);
+        assert!(!decoded.caveman.enabled);
+        assert_eq!(decoded.caveman.level, CavemanLevel::Full);
+        assert!(!decoded.headroom.enabled);
+        assert_eq!(decoded.headroom.service, "headroom");
+        assert!(decoded.runtime.auto_update);
     }
 
     #[test]

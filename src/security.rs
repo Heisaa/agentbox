@@ -37,6 +37,19 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if !config.workspace.container_path.starts_with('/') {
         anyhow::bail!("workspace.container_path must be absolute");
     }
+    if config.headroom.enabled {
+        if config.network.mode != NetworkMode::Compose {
+            anyhow::bail!("headroom.enabled requires network.mode = \"compose\"");
+        }
+        if config.headroom.service.trim().is_empty() {
+            anyhow::bail!("headroom.service must not be empty");
+        }
+        if !config.headroom.url.starts_with("http://")
+            && !config.headroom.url.starts_with("https://")
+        {
+            anyhow::bail!("headroom.url must start with http:// or https://");
+        }
+    }
     if !config.network.internet && config.network.mode != NetworkMode::None {
         anyhow::bail!(
             "internet = false requires network.mode = \"none\" in the MVP; Docker Compose \
@@ -178,6 +191,20 @@ mod tests {
     #[test]
     fn rejects_root_mount() {
         assert!(validate_workspace_path(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn headroom_requires_compose_networking() {
+        let mut config = Config::default();
+        config.headroom.enabled = true;
+        config.network.mode = NetworkMode::Bridge;
+
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("network.mode = \"compose\"")
+        );
     }
 
     #[test]

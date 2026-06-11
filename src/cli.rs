@@ -153,6 +153,21 @@ fn load_context(inspect_compose: bool) -> Result<AppContext> {
     } else {
         None
     };
+    if config.headroom.enabled && inspect_compose {
+        let compose = compose.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "headroom is enabled but no Compose project was found; add a `{}` service to a \
+                 configured Compose file",
+                config.headroom.service
+            )
+        })?;
+        if !compose.services.contains(&config.headroom.service) {
+            anyhow::bail!(
+                "headroom is enabled but Compose service `{}` was not found",
+                config.headroom.service
+            );
+        }
+    }
     let tools = project::detect_tools(&repo_root);
     Ok(AppContext {
         repo_root,
@@ -266,6 +281,11 @@ fn build_spec(
     if context.tools.rust {
         environment.insert("AGENTBOX_RUST_PROJECT".into(), "1".into());
     }
+    if context.config.headroom.enabled {
+        let url = context.config.headroom.url.trim_end_matches('/');
+        environment.insert("ANTHROPIC_BASE_URL".into(), url.into());
+        environment.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
+    }
     docker::build_run_spec(BuildInput {
         config: &context.config,
         repo_root: &context.repo_root,
@@ -286,7 +306,7 @@ fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Resul
     let mut command =
         shell_words::split(&executable).context("agent command contains invalid shell quoting")?;
     apply_agentbox_permissions(&mut command);
-    let guidance = project_guidance(tools);
+    let guidance = project_guidance(config, tools);
     match command.first().map(String::as_str) {
         Some("claude") => {
             command.push("--append-system-prompt".into());
@@ -339,7 +359,7 @@ fn apply_agentbox_permissions(command: &mut Vec<String>) {
     }
 }
 
-fn project_guidance(tools: &ProjectTools) -> String {
+fn project_guidance(config: &Config, tools: &ProjectTools) -> String {
     let package_manager = tools
         .package_manager
         .as_ref()
@@ -359,11 +379,26 @@ fn project_guidance(tools: &ProjectTools) -> String {
         String::new()
     };
 
-    AGENT_INSTRUCTIONS
-        .replace(PACKAGE_MANAGER_PLACEHOLDER, &package_manager)
-        .replace(RUST_PLACEHOLDER, &rust)
-        .trim()
-        .to_owned()
+    let caveman = if config.caveman.enabled {
+        format!(
+            "Caveman is enabled at the `{}` level. Use the installed Caveman skill and keep \
+             responses in that mode unless the user explicitly asks for normal mode.",
+            config.caveman.level.as_str()
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{}\n\n{}",
+        AGENT_INSTRUCTIONS
+            .replace(PACKAGE_MANAGER_PLACEHOLDER, &package_manager)
+            .replace(RUST_PLACEHOLDER, &rust)
+            .trim(),
+        caveman
+    )
+    .trim()
+    .to_owned()
 }
 
 fn print_banner(context: &AppContext, spec: &RunSpec) {
@@ -387,6 +422,22 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
     println!("- Network: {}", spec.network);
     println!("- Container user: {}", spec.uid_gid);
     println!("- Runtime image: {}", context.config.runtime.image);
+    println!(
+        "- Headroom proxy: {}",
+        if context.config.headroom.enabled {
+            context.config.headroom.url.as_str()
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "- Caveman: {}",
+        if context.config.caveman.enabled {
+            context.config.caveman.level.as_str()
+        } else {
+            "disabled"
+        }
+    );
     println!(
         "- Package manager: {}",
         context
@@ -573,14 +624,53 @@ mod tests {
 
     #[test]
     fn instruction_template_placeholders_are_fully_resolved() {
-        let guidance = project_guidance(&ProjectTools {
-            package_manager: Some("pnpm".into()),
-            rust: true,
-        });
+        let guidance = project_guidance(
+            &Config::default(),
+            &ProjectTools {
+                package_manager: Some("pnpm".into()),
+                rust: true,
+            },
+        );
         assert!(!guidance.contains("{{"));
         assert!(guidance.contains("uses pnpm"));
         assert!(guidance.contains("cargo clippy"));
         assert!(guidance.contains("\n## Environment limitations\n"));
         assert!(guidance.contains("Docker and Docker Compose may be unavailable"));
+    }
+
+    #[test]
+    fn caveman_guidance_uses_configured_level() {
+        let mut config = Config::default();
+        config.caveman.enabled = true;
+        config.caveman.level = crate::config::CavemanLevel::Ultra;
+
+        let guidance = project_guidance(&config, &ProjectTools::default());
+
+        assert!(guidance.contains("Caveman is enabled at the `ultra` level"));
+    }
+
+    #[test]
+    fn headroom_routes_provider_traffic_through_proxy() {
+        let mut config = Config::default();
+        config.headroom.enabled = true;
+        let temp = tempfile::tempdir().unwrap();
+        let context = AppContext {
+            repo_root: temp.path().to_path_buf(),
+            config,
+            compose_files: vec![],
+            compose: None,
+            tools: ProjectTools::default(),
+        };
+
+        let spec = build_spec(&context, &[], vec!["true".into()], false).unwrap();
+
+        assert_eq!(
+            spec.environment["ANTHROPIC_BASE_URL"],
+            "http://headroom:8787"
+        );
+        assert_eq!(
+            spec.environment["OPENAI_BASE_URL"],
+            "http://headroom:8787/v1"
+        );
     }
 }

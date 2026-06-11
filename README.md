@@ -69,20 +69,14 @@ The guidance explains that the agent is inside a restricted container, may not
 have Docker or running project services, must validate migration targets, and
 must leave Git publishing operations to the host.
 
-At container startup, the runtime checks npm for newer Claude Code and Codex
-versions. Registry failures do not prevent startup, and each query times out
-after four seconds. Rebuild the image to install reported updates:
-
-```bash
-docker build --pull -t agentbox/fullstack:latest \
-  -f images/fullstack/Dockerfile .
-```
-
-Disable startup checks for offline or latency-sensitive projects:
+At each container startup, the runtime updates Claude Code and Codex from npm
+into `$HOME/.agentbox/npm` in the persistent agent home. Each update times out
+after 60 seconds, and a registry or installation failure does not prevent
+startup. Disable automatic updates for offline or latency-sensitive projects:
 
 ```toml
-[env.defaults]
-AGENTBOX_CHECK_UPDATES = "0"
+[runtime]
+auto_update = false
 ```
 
 `agentbox init` creates `.agentbox/config.toml`, an ignored local development
@@ -107,6 +101,54 @@ verify that the selected network exists and otherwise direct you to run
 [network]
 compose_network = "backend"
 ```
+
+## Headroom proxy
+
+Agentbox can route provider traffic through a
+[Headroom](https://github.com/chopratejas/headroom) proxy running as a Docker
+Compose service. Enable it in `.agentbox/config.toml`:
+
+```toml
+[headroom]
+enabled = true
+service = "headroom"
+url = "http://headroom:8787"
+```
+
+Add the service to the project's Compose file:
+
+```yaml
+services:
+  headroom:
+    image: ghcr.io/chopratejas/headroom:latest
+    restart: unless-stopped
+    environment:
+      HEADROOM_HOST: 0.0.0.0
+      HEADROOM_TELEMETRY: "off"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+```
+
+Start it with `agentbox up headroom`. The agent container receives only the
+proxy URLs; provider keys remain in the Headroom container. The included
+[`compose.yaml`](compose.yaml) provides this service for developing Agentbox.
+
+## Caveman
+
+Agentbox can install and activate the
+[Caveman](https://github.com/JuliusBrussee/caveman) output-compression skill
+for Claude Code and Codex:
+
+```toml
+[caveman]
+enabled = true
+level = "full"
+```
+
+Supported levels are `lite`, `full`, `ultra`, and `wenyan`. Agentbox installs
+the pinned Caveman `v1.8.2` release into the persistent agent home on first
+use. Caveman affects response verbosity, while Headroom compresses request
+context; both options can be enabled together.
 
 Only variables listed in `[env].allow` or `[env.defaults]`, plus values from
 the configured project-local env file, enter the container. Sensitive names

@@ -124,6 +124,16 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     args.push(OsString::from("HOME=/home/agent"));
     args.push(OsString::from("--env"));
     args.push(OsString::from("AGENTBOX=1"));
+    args.push(OsString::from("--env"));
+    args.push(OsString::from(format!(
+        "AGENTBOX_AUTO_UPDATE={}",
+        u8::from(config.runtime.auto_update)
+    )));
+    args.push(OsString::from("--env"));
+    args.push(OsString::from(format!(
+        "AGENTBOX_CAVEMAN={}",
+        u8::from(config.caveman.enabled)
+    )));
 
     args.push(OsString::from(&config.runtime.image));
     args.extend(input.command.iter().map(OsString::from));
@@ -229,6 +239,8 @@ mod tests {
         let rendered = format_command(&spec);
         assert!(!rendered.contains("/var/run/docker.sock"));
         assert!(rendered.contains("HOME=/home/agent"));
+        assert!(rendered.contains("AGENTBOX_AUTO_UPDATE=1"));
+        assert!(rendered.contains("AGENTBOX_CAVEMAN=0"));
         assert!(rendered.contains("--cap-drop ALL"));
         assert!(rendered.contains("--network bridge"));
         assert!(rendered.contains("type=bind,src="));
@@ -251,6 +263,44 @@ mod tests {
         })
         .unwrap();
         assert!(format_command(&spec).contains(",readonly"));
+    }
+
+    #[test]
+    fn auto_updates_can_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.runtime.auto_update = false;
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+        })
+        .unwrap();
+
+        assert!(format_command(&spec).contains("AGENTBOX_AUTO_UPDATE=0"));
+    }
+
+    #[test]
+    fn caveman_can_be_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.caveman.enabled = true;
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+        })
+        .unwrap();
+
+        assert!(format_command(&spec).contains("AGENTBOX_CAVEMAN=1"));
     }
 
     #[test]
