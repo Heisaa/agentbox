@@ -5,6 +5,66 @@ set -u
 agent_update_prefix="$HOME/.agentbox/npm"
 export PATH="$agent_update_prefix/bin:$PATH"
 
+import_agent_credentials() {
+    case "${AGENTBOX_IMPORT_CREDENTIALS:-}" in
+        claude)
+            source="/tmp/agentbox-claude-credentials.json"
+            destination="$HOME/.claude/.credentials.json"
+            ;;
+        codex)
+            source="/tmp/agentbox-codex-auth.json"
+            destination="$HOME/.codex/auth.json"
+            ;;
+        "")
+            return
+            ;;
+        *)
+            printf '%s\n' \
+                "- Unknown credential type '$AGENTBOX_IMPORT_CREDENTIALS'; skipping import" >&2
+            return
+            ;;
+    esac
+
+    if [ ! -f "$source" ]; then
+        printf '%s\n' "- Credential source is unavailable; skipping import" >&2
+        return
+    fi
+
+    destination_directory="$(dirname "$destination")"
+    session_directory="/tmp/agentbox-credentials/$AGENTBOX_IMPORT_CREDENTIALS"
+    session_credential="$session_directory/$(basename "$destination")"
+    mkdir -p "$destination_directory" "$session_directory"
+    chmod 700 "$destination_directory" "$session_directory"
+    cp "$source" "$session_credential"
+    chmod 600 "$session_credential"
+    rm -f "$destination"
+    ln -s "$session_credential" "$destination"
+    printf '%s\n' "Agent credentials:"
+    printf '%s\n' "- Imported $AGENTBOX_IMPORT_CREDENTIALS credentials from host"
+}
+
+import_claude_state() {
+    if [ "${AGENTBOX_IMPORT_CLAUDE_STATE:-0}" != "1" ]; then
+        return
+    fi
+
+    source="/tmp/agentbox-claude-state.json"
+    destination="$HOME/.claude.json"
+    if [ ! -f "$source" ]; then
+        printf '%s\n' "- Claude onboarding state is unavailable; skipping import" >&2
+        return
+    fi
+
+    temporary="/tmp/agentbox-claude-state-merged.json"
+    if [ -f "$destination" ] && jq -e 'type == "object"' "$destination" >/dev/null 2>&1; then
+        jq -s '.[0] * .[1]' "$destination" "$source" >"$temporary"
+    else
+        cp "$source" "$temporary"
+    fi
+    chmod 600 "$temporary"
+    mv "$temporary" "$destination"
+}
+
 update_agent() {
     package="$1"
     label="$2"
@@ -68,6 +128,9 @@ install_caveman() {
         printf '%s\n' "- install failed; continuing without Caveman" >&2
     fi
 }
+
+import_agent_credentials
+import_claude_state
 
 if [ "${AGENTBOX_AUTO_UPDATE:-1}" != "0" ] && [ -n "${AGENTBOX_UPDATE_AGENT:-}" ]; then
     printf '%s\n' "Agent updates:"

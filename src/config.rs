@@ -32,6 +32,12 @@ pub struct ConfigUpdate {
     pub removed: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct RuntimeImageUpdate {
+    pub path: PathBuf,
+    pub dockerfile: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -163,6 +169,8 @@ pub struct LimitsConfig {
 #[serde(default)]
 pub struct RuntimeConfig {
     pub image: String,
+    pub dockerfile: PathBuf,
+    pub build_context: PathBuf,
     pub auto_update: bool,
 }
 
@@ -270,6 +278,8 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             image: "agentbox/fullstack:latest".into(),
+            dockerfile: PathBuf::new(),
+            build_context: PathBuf::from("."),
             auto_update: true,
         }
     }
@@ -364,6 +374,51 @@ impl Config {
             backup_path,
             added,
             removed,
+        })
+    }
+
+    pub fn enable_runtime_image(
+        repo_root: &Path,
+        image: &str,
+        dockerfile: &Path,
+        build_context: &Path,
+    ) -> Result<RuntimeImageUpdate> {
+        let path = repo_root.join(CONFIG_FILE);
+        if !path.exists() {
+            anyhow::bail!(
+                "{} does not exist; run `agentbox init` first",
+                path.display()
+            );
+        }
+
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut actual: toml::Value =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        let table = actual
+            .as_table_mut()
+            .context("agentbox config must contain a TOML table")?;
+        let runtime = table
+            .entry("runtime")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("runtime config must be a TOML table")?;
+        runtime.insert("image".into(), toml::Value::String(image.into()));
+        runtime.insert(
+            "dockerfile".into(),
+            toml::Value::String(dockerfile.to_string_lossy().into_owned()),
+        );
+        runtime.insert(
+            "build_context".into(),
+            toml::Value::String(build_context.to_string_lossy().into_owned()),
+        );
+
+        let updated = toml::to_string_pretty(&actual).context("failed to serialize config")?;
+        fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+
+        Ok(RuntimeImageUpdate {
+            path,
+            dockerfile: repo_root.join(dockerfile),
         })
     }
 }
@@ -503,6 +558,8 @@ mod tests {
         assert_eq!(decoded.caveman.level, CavemanLevel::Full);
         assert!(!decoded.headroom.enabled);
         assert_eq!(decoded.headroom.service, "headroom");
+        assert!(decoded.runtime.dockerfile.as_os_str().is_empty());
+        assert_eq!(decoded.runtime.build_context, Path::new("."));
         assert!(decoded.runtime.auto_update);
     }
 
@@ -622,5 +679,34 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let error = Config::update(temp.path()).unwrap_err().to_string();
         assert!(error.contains("agentbox init"));
+    }
+
+    #[test]
+    fn enabling_runtime_image_preserves_unknown_config() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(CONFIG_DIR)).unwrap();
+        fs::write(
+            temp.path().join(CONFIG_FILE),
+            "version = 1\ncustom = \"keep\"\n",
+        )
+        .unwrap();
+
+        Config::enable_runtime_image(
+            temp.path(),
+            "example/base:1",
+            Path::new(".agentbox/Dockerfile"),
+            Path::new("."),
+        )
+        .unwrap();
+        let raw: toml::Value =
+            toml::from_str(&fs::read_to_string(temp.path().join(CONFIG_FILE)).unwrap()).unwrap();
+
+        assert_eq!(raw["custom"].as_str(), Some("keep"));
+        assert_eq!(raw["runtime"]["image"].as_str(), Some("example/base:1"));
+        assert_eq!(
+            raw["runtime"]["dockerfile"].as_str(),
+            Some(".agentbox/Dockerfile")
+        );
+        assert_eq!(raw["runtime"]["build_context"].as_str(), Some("."));
     }
 }

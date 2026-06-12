@@ -14,11 +14,9 @@ portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shell-words = "1.1"
+tempfile = "3.20"
 toml = "1.1.2"
 vt100 = "0.16"
-
-[dev-dependencies]
-tempfile = "3.20"
 
 # Vendored vt100 with a local patch: lines scrolled off a top-anchored scroll
 # region go to scrollback, so codex's inline mode keeps a scrollable

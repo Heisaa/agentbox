@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -32,6 +33,10 @@ enum Commands {
     Init,
     /// Update the project configuration to the current schema.
     UpdateConfig,
+    /// Create a project-specific runtime Dockerfile.
+    InitImage(InitImageArgs),
+    /// Build the configured project-specific runtime image.
+    Build,
     /// Run a coding agent in the sandbox.
     Run(RunArgs),
     /// Open a shell in the sandbox.
@@ -56,6 +61,13 @@ struct SandboxArgs {
     /// Explicitly permit a sensitive variable named in the env allowlist.
     #[arg(long = "allow-secret", value_name = "NAME")]
     allow_secrets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+struct InitImageArgs {
+    /// Base image for the project-specific runtime.
+    #[arg(long, default_value = "agentbox/fullstack:latest")]
+    base_image: String,
 }
 
 #[derive(Debug, Clone, Default, Args)]
@@ -88,9 +100,11 @@ enum RuntimeNetworkAction {
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     match cli.command {
-        None => run_agent(&RunArgs::default(), false),
+        None => crate::tui::run(),
         Some(Commands::Init) => init(),
         Some(Commands::UpdateConfig) => update_config(),
+        Some(Commands::InitImage(args)) => init_image(&args),
+        Some(Commands::Build) => build_runtime(),
         Some(Commands::Run(args)) => run_agent(&args, false),
         Some(Commands::Shell(args)) => run_shell(&args),
         Some(Commands::Up { services }) => compose_action("up", &services),
@@ -121,7 +135,7 @@ fn init() -> Result<u8> {
          # REDIS_URL=redis://redis:6379\n",
     )
     .with_context(|| format!("failed to write {}", env_example.display()))?;
-    fs::write(&gitignore, "env\nenv.local\nsecrets/\n")
+    fs::write(&gitignore, "env\nenv.local\nsecrets/\nuploads/\n")
         .with_context(|| format!("failed to write {}", gitignore.display()))?;
 
     println!("Created:");
@@ -162,6 +176,76 @@ fn update_config() -> Result<u8> {
     );
     println!("- Backup: {}", relative(&repo_root, &update.backup_path));
     Ok(0)
+}
+
+fn init_image(args: &InitImageArgs) -> Result<u8> {
+    let repo_root = project::find_repo_root()?;
+    let base_image = args.base_image.trim();
+    if base_image.is_empty() || base_image.chars().any(char::is_whitespace) {
+        anyhow::bail!("base image must be a non-empty container image reference");
+    }
+    let config_path = repo_root.join(crate::config::CONFIG_FILE);
+    if !config_path.is_file() {
+        anyhow::bail!(
+            "{} does not exist; run `agentbox init` first",
+            config_path.display()
+        );
+    }
+
+    let relative_dockerfile = Path::new(".agentbox/Dockerfile");
+    let dockerfile = repo_root.join(relative_dockerfile);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dockerfile)
+        .with_context(|| {
+            if dockerfile.exists() {
+                format!(
+                    "{} already exists; refusing to overwrite it",
+                    dockerfile.display()
+                )
+            } else {
+                format!("failed to create {}", dockerfile.display())
+            }
+        })?;
+    let template = runtime_dockerfile_template(base_image);
+    if let Err(error) = file.write_all(template.as_bytes()) {
+        let _ = fs::remove_file(&dockerfile);
+        return Err(error).with_context(|| format!("failed to write {}", dockerfile.display()));
+    }
+
+    let update = match Config::enable_runtime_image(
+        &repo_root,
+        base_image,
+        relative_dockerfile,
+        Path::new("."),
+    ) {
+        Ok(update) => update,
+        Err(error) => {
+            let _ = fs::remove_file(&dockerfile);
+            return Err(error);
+        }
+    };
+
+    println!("Created {}", relative(&repo_root, &update.dockerfile));
+    println!("Updated {}", relative(&repo_root, &update.path));
+    println!("- Base image: {base_image}");
+    println!("\nAdd project packages to the Dockerfile, then run `agentbox build`.");
+    Ok(0)
+}
+
+fn runtime_dockerfile_template(base_image: &str) -> String {
+    format!(
+        "ARG AGENTBOX_BASE_IMAGE={base_image}\n\
+         FROM ${{AGENTBOX_BASE_IMAGE}}\n\
+         \n\
+         USER root\n\
+         \n\
+         # Add project-specific system packages here. For example:\n\
+         # RUN apt-get update \\\n\
+         #     && apt-get install -y --no-install-recommends ffmpeg \\\n\
+         #     && rm -rf /var/lib/apt/lists/*\n"
+    )
 }
 
 fn load_context(inspect_compose: bool) -> Result<AppContext> {
@@ -222,10 +306,12 @@ fn run_agent(args: &RunArgs, explain: bool) -> Result<u8> {
     if explain {
         let spec = build_spec(&context, &args.allow_secrets, command, false)?;
         print_banner(&context, &spec);
+        print_build_command(&context)?;
         println!("\n{}", docker::format_command(&spec));
         Ok(0)
     } else {
         ensure_docker_available()?;
+        build_runtime_image(&context)?;
         prepare_runtime_network(&mut context)?;
         let spec = build_spec(&context, &args.allow_secrets, command, true)?;
         print_banner(&context, &spec);
@@ -237,6 +323,7 @@ fn run_shell(args: &SandboxArgs) -> Result<u8> {
     let mut context = load_context(true)?;
     let shell = vec!["bash".into()];
     ensure_docker_available()?;
+    build_runtime_image(&context)?;
     prepare_runtime_network(&mut context)?;
     let spec = build_spec(&context, &args.allow_secrets, shell, true)?;
     print_banner(&context, &spec);
@@ -292,8 +379,50 @@ fn doctor(args: &SandboxArgs) -> Result<u8> {
             }
         );
     }
+    if let Some(build) = docker::build_image_spec(&context.config, &context.repo_root)? {
+        println!("- Project runtime image: {}", build.image);
+        println!(
+            "\nDocker build command:\n{}",
+            docker::format_image_build_command(&build)
+        );
+    }
     println!("\nDocker command:\n{}", docker::format_command(&spec));
     Ok(0)
+}
+
+fn build_runtime() -> Result<u8> {
+    let context = load_context(false)?;
+    ensure_docker_available()?;
+    let Some(spec) = docker::build_image_spec(&context.config, &context.repo_root)? else {
+        anyhow::bail!(
+            "runtime.dockerfile is not configured in {}",
+            crate::config::CONFIG_FILE
+        );
+    };
+    println!("Building {}", spec.image);
+    docker::execute_image_build(&spec)
+}
+
+fn build_runtime_image(context: &AppContext) -> Result<()> {
+    let Some(spec) = docker::build_image_spec(&context.config, &context.repo_root)? else {
+        return Ok(());
+    };
+    println!("Building project runtime image {}...", spec.image);
+    let status = docker::execute_image_build(&spec)?;
+    if status != 0 {
+        anyhow::bail!("project runtime image build failed with exit code {status}");
+    }
+    Ok(())
+}
+
+fn print_build_command(context: &AppContext) -> Result<()> {
+    if let Some(spec) = docker::build_image_spec(&context.config, &context.repo_root)? {
+        println!(
+            "\nDocker build command:\n{}",
+            docker::format_image_build_command(&spec)
+        );
+    }
+    Ok(())
 }
 
 fn compose_action(action: &str, services: &[String]) -> Result<u8> {
@@ -382,6 +511,7 @@ fn build_spec(
         config: &context.config,
         repo_root: &context.repo_root,
         workspace: &workspace,
+        host_home: dirs::home_dir().as_deref(),
         compose: context.compose.as_ref(),
         environment,
         command,
@@ -503,7 +633,12 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
     println!("- Host home mounted: no");
     println!("- SSH agent mounted: no");
     println!("- Docker socket mounted: no");
-    println!("- Host credentials imported implicitly: no");
+    println!(
+        "- Host agent credentials: {}",
+        spec.imported_credentials
+            .map(|agent| format!("{agent} (read-only source, container-local copy)"))
+            .unwrap_or_else(|| "none".into())
+    );
     println!(
         "- Internet access: {}",
         if spec.network != "none" {
@@ -514,7 +649,10 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
     );
     println!("- Network: {}", spec.network);
     println!("- Container user: {}", spec.uid_gid);
-    println!("- Runtime image: {}", context.config.runtime.image);
+    println!(
+        "- Runtime image: {}",
+        docker::runtime_image(&context.config, &context.repo_root)
+    );
     println!(
         "- Headroom proxy: {}",
         if context.config.headroom.enabled {
@@ -733,9 +871,32 @@ mod tests {
     }
 
     #[test]
-    fn bare_invocation_selects_default_run() {
+    fn bare_invocation_selects_default_tui() {
         let cli = Cli::try_parse_from(["agentbox"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn build_subcommand_is_available() {
+        let cli = Cli::try_parse_from(["agentbox", "build"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Build)));
+    }
+
+    #[test]
+    fn init_image_subcommand_has_a_default_base_image() {
+        let cli = Cli::try_parse_from(["agentbox", "init-image"]).unwrap();
+        let Some(Commands::InitImage(args)) = cli.command else {
+            panic!("expected init-image command");
+        };
+        assert_eq!(args.base_image, "agentbox/fullstack:latest");
+    }
+
+    #[test]
+    fn runtime_dockerfile_template_uses_the_selected_base() {
+        let template = runtime_dockerfile_template("example/base:1");
+        assert!(template.contains("ARG AGENTBOX_BASE_IMAGE=example/base:1"));
+        assert!(template.contains("FROM ${AGENTBOX_BASE_IMAGE}"));
+        assert!(template.contains("apt-get install"));
     }
 
     #[test]

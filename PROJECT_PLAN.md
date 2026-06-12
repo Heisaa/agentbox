@@ -44,7 +44,7 @@ agentbox policy explain
    Network, Docker socket access, extra mounts, credentials, and host-level operations require explicit opt-in.
 
 7. **The default mode should be boring and safe**
-   A new user should be able to run `agentbox run claude` in a repo without thinking through Docker networking, UID mapping, secrets, or shell setup.
+   A new user should be able to run `agentbox`, select a repository, and resume that session later without thinking through Docker networking, UID mapping, secrets, or shell setup.
 
 ## 4. Threat model
 
@@ -94,9 +94,12 @@ A small host-side CLI, probably written in Rust.
 Responsibilities:
 
 * Detect repo root.
+* Provide a repository-first TUI when launched without a subcommand.
 * Detect Docker Compose files.
 * Build or pull an agent runtime image.
 * Create an isolated agent container.
+* Persist TUI repository tabs and restart agents with their resume commands.
+* Clean up labeled orphaned Agentbox containers.
 * Mount the repo into the container.
 * Attach the agent container to the correct Compose network.
 * Inject safe environment variables.

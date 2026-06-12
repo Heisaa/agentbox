@@ -37,6 +37,14 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if !config.workspace.container_path.starts_with('/') {
         anyhow::bail!("workspace.container_path must be absolute");
     }
+    if config.runtime.image.trim().is_empty() {
+        anyhow::bail!("runtime.image must not be empty");
+    }
+    if !config.runtime.dockerfile.as_os_str().is_empty()
+        && config.runtime.build_context.as_os_str().is_empty()
+    {
+        anyhow::bail!("runtime.build_context must not be empty when runtime.dockerfile is set");
+    }
     if config.headroom.enabled {
         if config.network.mode != NetworkMode::Compose {
             anyhow::bail!("headroom.enabled requires network.mode = \"compose\"");
@@ -57,6 +65,26 @@ pub fn validate_config(config: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub fn resolve_repo_path(repo_root: &Path, configured: &Path, kind: &str) -> Result<PathBuf> {
+    let canonical_repo = fs::canonicalize(repo_root)
+        .with_context(|| format!("failed to resolve repository root {}", repo_root.display()))?;
+    let path = if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        canonical_repo.join(configured)
+    };
+    let canonical = fs::canonicalize(&path)
+        .with_context(|| format!("{kind} does not exist: {}", path.display()))?;
+    if !canonical.starts_with(&canonical_repo) {
+        anyhow::bail!(
+            "{kind} {} is outside repository {}",
+            canonical.display(),
+            canonical_repo.display()
+        );
+    }
+    Ok(canonical)
 }
 
 pub fn resolve_workspace(repo_root: &Path, mount: &Path) -> Result<PathBuf> {
@@ -147,6 +175,23 @@ pub(crate) fn is_sensitive(name: &str) -> bool {
         || name.ends_with("_PASSWORD")
         || name.ends_with("_SECRET")
         || name.ends_with("_PRIVATE_KEY")
+}
+
+#[cfg(test)]
+mod repo_path_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_paths_must_remain_inside_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+
+        let error = resolve_repo_path(repo.path(), outside.path(), "runtime Dockerfile")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("outside repository"));
+    }
 }
 
 fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>> {

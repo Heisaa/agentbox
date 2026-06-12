@@ -30,7 +30,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupmod --new-name agent node \
-    && usermod --login agent --home /home/agent --move-home node
+    && usermod --login agent --home /home/agent --move-home node \
+    && install -d -o agent -g agent -m 0755 /home/agent/.cargo/registry
 
 COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
