@@ -8,14 +8,23 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 dirs = "6.0"
+portable-pty = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 shell-words = "1.1"
 toml = "1.1.2"
+vt100 = "0.16"
 
 [dev-dependencies]
 tempfile = "3.20"
+
+# Vendored vt100 with a local patch: lines scrolled off a top-anchored scroll
+# region go to scrollback, so codex's inline mode keeps a scrollable
+# transcript in the TUI. See vendor/vt100/Cargo.toml.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
 
 [profile.release]
 strip = true

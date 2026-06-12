@@ -147,20 +147,47 @@ fn display_networks(networks: &serde_json::Map<String, Value>) -> String {
         .join(", ")
 }
 
-pub fn ensure_network_exists(network: &str) -> Result<()> {
+pub fn network_exists(network: &str) -> Result<bool> {
     let output = Command::new("docker")
         .args(["network", "inspect", network])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()
         .context("failed to inspect Docker network")?;
-    if !output.status.success() {
+    Ok(output.status.success())
+}
+
+pub fn ensure_network_exists(network: &str) -> Result<()> {
+    if !network_exists(network)? {
         anyhow::bail!(
             "Compose network `{network}` is unavailable; run `agentbox up` first or select an \
              existing network with `network.compose_network`"
         );
     }
     Ok(())
+}
+
+pub fn list_services(repo_root: &Path, files: &[PathBuf]) -> Result<Vec<String>> {
+    if files.is_empty() {
+        anyhow::bail!("no Compose file configured or detected");
+    }
+    let output = command(repo_root, files)
+        .args(["config", "--services"])
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to list Docker Compose services")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "docker compose config --services failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|service| !service.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 pub fn run_action(

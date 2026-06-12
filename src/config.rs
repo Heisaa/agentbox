@@ -24,6 +24,14 @@ pub struct LoadedConfig {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug)]
+pub struct ConfigUpdate {
+    pub path: PathBuf,
+    pub backup_path: PathBuf,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -309,6 +317,110 @@ impl Config {
             .with_context(|| format!("failed to write {}", path.display()))?;
         Ok(path)
     }
+
+    pub fn update(repo_root: &Path) -> Result<ConfigUpdate> {
+        let path = repo_root.join(CONFIG_FILE);
+        if !path.exists() {
+            anyhow::bail!(
+                "{} does not exist; run `agentbox init` first",
+                path.display()
+            );
+        }
+
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut actual: toml::Value =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        let parsed: Self =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        if parsed.version != 1 {
+            anyhow::bail!(
+                "unsupported config version {} in {}; expected 1",
+                parsed.version,
+                path.display()
+            );
+        }
+
+        let expected =
+            toml::Value::try_from(Self::default()).context("failed to build config schema")?;
+        let mut added = Vec::new();
+        merge_missing("", &mut actual, &expected, &mut added);
+
+        let mut removed = Vec::new();
+        for (deprecated, _) in DEPRECATED_KEYS {
+            if remove_path(&mut actual, deprecated) {
+                removed.push((*deprecated).to_owned());
+            }
+        }
+
+        let updated = toml::to_string_pretty(&actual).context("failed to serialize config")?;
+        let backup_path = path.with_extension("toml.bak");
+        fs::copy(&path, &backup_path)
+            .with_context(|| format!("failed to create {}", backup_path.display()))?;
+        fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+
+        Ok(ConfigUpdate {
+            path,
+            backup_path,
+            added,
+            removed,
+        })
+    }
+}
+
+fn merge_missing(
+    path: &str,
+    actual: &mut toml::Value,
+    expected: &toml::Value,
+    added: &mut Vec<String>,
+) {
+    let (Some(actual), Some(expected)) = (actual.as_table_mut(), expected.as_table()) else {
+        return;
+    };
+
+    for (key, expected_value) in expected {
+        let key_path = join_path(path, key);
+        match actual.get_mut(key) {
+            None => {
+                actual.insert(key.clone(), expected_value.clone());
+                added.push(key_path);
+            }
+            Some(actual_value) if expected_value.is_table() && actual_value.is_table() => {
+                if !DYNAMIC_TABLES.contains(&key_path.as_str()) {
+                    merge_missing(&key_path, actual_value, expected_value, added);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+fn remove_path(value: &mut toml::Value, path: &str) -> bool {
+    fn remove(table: &mut toml::Table, segments: &[&str]) -> bool {
+        let [segment, rest @ ..] = segments else {
+            return false;
+        };
+        if rest.is_empty() {
+            return table.remove(*segment).is_some();
+        }
+
+        let (removed, empty) = {
+            let Some(next) = table.get_mut(*segment).and_then(toml::Value::as_table_mut) else {
+                return false;
+            };
+            let removed = remove(next, rest);
+            (removed, removed && next.is_empty())
+        };
+        if empty {
+            table.remove(*segment);
+        }
+        removed
+    }
+
+    let Some(table) = value.as_table_mut() else {
+        return false;
+    };
+    remove(table, &path.split('.').collect::<Vec<_>>())
 }
 
 fn compare_schema(
@@ -460,5 +572,55 @@ mod tests {
         assert!(warnings.iter().any(|warning| {
             warning == "deprecated `network.auto_detect_project` is ignored and has no replacement"
         }));
+    }
+
+    #[test]
+    fn update_preserves_values_and_unknown_keys_while_normalizing_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(CONFIG_DIR);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            temp.path().join(CONFIG_FILE),
+            "version = 1\n\
+             custom = \"keep\"\n\
+             \n\
+             [agent]\n\
+             default = \"codex\"\n\
+             command = \"codex\"\n\
+             home = \"ephemeral\"\n\
+             allow_network = false\n\
+             \n\
+             [project]\n\
+             workdir = \"/old-workspace\"\n\
+             mount = \".\"\n\
+             \n\
+             [env.defaults]\n\
+             CUSTOM_VALUE = \"yes\"\n",
+        )
+        .unwrap();
+
+        let update = Config::update(temp.path()).unwrap();
+        let raw: toml::Value = toml::from_str(&fs::read_to_string(&update.path).unwrap()).unwrap();
+
+        assert_eq!(raw["custom"].as_str(), Some("keep"));
+        assert_eq!(raw["agent"]["default"].as_str(), Some("codex"));
+        assert!(raw["agent"].get("allow_network").is_none());
+        assert!(raw.get("project").is_none());
+        assert_eq!(raw["env"]["defaults"]["CUSTOM_VALUE"].as_str(), Some("yes"));
+        assert!(raw["caveman"].is_table());
+        assert!(raw["headroom"].is_table());
+        assert!(update.added.contains(&"caveman".into()));
+        assert!(update.removed.contains(&"agent.allow_network".into()));
+        assert_eq!(
+            fs::read_to_string(update.backup_path).unwrap(),
+            "version = 1\ncustom = \"keep\"\n\n[agent]\ndefault = \"codex\"\ncommand = \"codex\"\nhome = \"ephemeral\"\nallow_network = false\n\n[project]\nworkdir = \"/old-workspace\"\nmount = \".\"\n\n[env.defaults]\nCUSTOM_VALUE = \"yes\"\n"
+        );
+    }
+
+    #[test]
+    fn update_requires_an_existing_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = Config::update(temp.path()).unwrap_err().to_string();
+        assert!(error.contains("agentbox init"));
     }
 }

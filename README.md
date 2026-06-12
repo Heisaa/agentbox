@@ -40,8 +40,10 @@ cargo install --path .
 ```bash
 cd /path/to/project
 agentbox init
+agentbox update-config
 agentbox doctor
 agentbox
+agentbox tui
 agentbox explain claude
 agentbox run claude
 agentbox shell
@@ -50,6 +52,19 @@ agentbox down
 ```
 
 Running `agentbox` without a subcommand starts the configured default agent.
+`agentbox tui` opens a multi-session terminal interface. The left sidebar lists
+active sessions, and `Ctrl-N` opens a session in another repository. Use `F6`
+to switch sessions, `F3` to open the host's `lazygit` in the active repository,
+`F5` to run Claude's `/usage` or Codex's `/status`, and `F2` to open the
+captured detail view. Closing `lazygit` returns to the agent view. The latest
+status is shown subtly below the active terminal. Conversation history scrolls
+with the mouse wheel or Page Up/Down without triggering prompt history; the
+view stays anchored while the agent streams output, and `End` jumps back to
+the live view. Drag with the left mouse button to select text in the
+conversation — releasing the button copies it to the system clipboard via
+OSC 52 (Codex runs in inline mode so its history is preserved too). Press `F1`
+for the complete key reference.
+
 Direct Claude commands are launched with `--dangerously-skip-permissions`, and
 direct Codex commands use `--dangerously-bypass-approvals-and-sandbox`.
 Agentbox provides the external container boundary, so the agents do not add
@@ -69,10 +84,13 @@ The guidance explains that the agent is inside a restricted container, may not
 have Docker or running project services, must validate migration targets, and
 must leave Git publishing operations to the host.
 
-At each container startup, the runtime updates Claude Code and Codex from npm
-into `$HOME/.agentbox/npm` in the persistent agent home. Each update times out
-after 60 seconds, and a registry or installation failure does not prevent
-startup. Disable automatic updates for offline or latency-sensitive projects:
+At container startup, the runtime updates only the agent being started from npm
+into `$HOME/.agentbox/npm` in the persistent agent home. For example,
+`agentbox run codex` checks Codex but not Claude Code. If the persisted version
+matches npm's `latest` version, installation is skipped. Version checks time
+out after 15 seconds, updates time out after 60 seconds, and registry or
+installation failures do not prevent startup. Disable automatic updates for
+offline or latency-sensitive projects:
 
 ```toml
 [runtime]
@@ -86,6 +104,10 @@ you use a custom image.
 When loading an existing config, Agentbox warns about missing current options,
 unknown options, and recognized deprecated names. Missing options continue
 using their built-in defaults, so compatible older configs still run.
+Run `agentbox update-config` to add missing options with their current defaults
+and remove recognized deprecated options. Existing supported values and
+unknown custom options are preserved. The previous file is saved as
+`.agentbox/config.toml.bak`.
 
 Workspace mounts are restricted to the repository root or one of its
 subdirectories, including after resolving symlinks. `doctor` and `explain`
@@ -93,9 +115,10 @@ redact sensitive environment values from displayed Docker commands.
 
 In Compose mode, Agentbox selects the default network or the sole network used
 by project services. Set `network.compose_network` to a Compose network key or
-resolved Docker network name when a project uses multiple networks. Agent runs
-verify that the selected network exists and otherwise direct you to run
-`agentbox up`.
+resolved Docker network name when a project uses multiple networks. If the
+selected network does not exist yet, agent runs fall back to Docker's bridge
+network. Run `agentbox up` when the agent needs to reach project services by
+their Compose service names.
 
 ```toml
 [network]
@@ -129,9 +152,12 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
 ```
 
-Start it with `agentbox up headroom`. The agent container receives only the
-proxy URLs; provider keys remain in the Headroom container. The included
-[`compose.yaml`](compose.yaml) provides this service for developing Agentbox.
+When enabled, Agentbox starts the configured Headroom service automatically
+before launching an agent or shell. Agentbox refuses to start that service
+while `headroom.enabled` is false, and excludes it from a bare `agentbox up`.
+The agent container receives only the proxy URLs; provider keys remain in the
+Headroom container. The included [`compose.yaml`](compose.yaml) provides this
+service for developing Agentbox.
 
 ## Caveman
 

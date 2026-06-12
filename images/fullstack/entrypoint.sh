@@ -8,6 +8,24 @@ export PATH="$agent_update_prefix/bin:$PATH"
 update_agent() {
     package="$1"
     label="$2"
+    installed_version="$(
+        npm list --global --prefix "$agent_update_prefix" --depth=0 --json 2>/dev/null |
+            jq -r --arg package "$package" '.dependencies[$package].version // empty'
+    )"
+    latest_version="$(
+        timeout 15s npm view \
+            --cache /tmp/agentbox-npm-cache \
+            --loglevel error \
+            "$package@latest" version 2>/dev/null
+    )"
+
+    if [ -n "$installed_version" ] &&
+        [ -n "$latest_version" ] &&
+        [ "$installed_version" = "$latest_version" ]
+    then
+        printf '%s\n' "- $label: up to date ($installed_version)"
+        return
+    fi
 
     if timeout 60s npm install \
         --global \
@@ -51,11 +69,20 @@ install_caveman() {
     fi
 }
 
-if [ "${AGENTBOX_AUTO_UPDATE:-1}" != "0" ]; then
+if [ "${AGENTBOX_AUTO_UPDATE:-1}" != "0" ] && [ -n "${AGENTBOX_UPDATE_AGENT:-}" ]; then
     printf '%s\n' "Agent updates:"
     mkdir -p "$agent_update_prefix"
-    update_agent "@anthropic-ai/claude-code" "Claude Code"
-    update_agent "@openai/codex" "Codex"
+    case "$AGENTBOX_UPDATE_AGENT" in
+        claude)
+            update_agent "@anthropic-ai/claude-code" "Claude Code"
+            ;;
+        codex)
+            update_agent "@openai/codex" "Codex"
+            ;;
+        *)
+            printf '%s\n' "- Unknown agent '$AGENTBOX_UPDATE_AGENT'; skipping update" >&2
+            ;;
+    esac
 fi
 
 if [ "${AGENTBOX_CAVEMAN:-0}" = "1" ]; then

@@ -30,6 +30,8 @@ struct Cli {
 enum Commands {
     /// Generate a safe project configuration.
     Init,
+    /// Update the project configuration to the current schema.
+    UpdateConfig,
     /// Run a coding agent in the sandbox.
     Run(RunArgs),
     /// Open a shell in the sandbox.
@@ -45,6 +47,8 @@ enum Commands {
     Doctor(SandboxArgs),
     /// Print the exact docker run command without executing it.
     Explain(RunArgs),
+    /// Open the multi-session terminal interface.
+    Tui,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -74,17 +78,26 @@ struct AppContext {
     tools: ProjectTools,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeNetworkAction {
+    StartHeadroom,
+    UseCompose,
+    UseBridge,
+}
+
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     match cli.command {
         None => run_agent(&RunArgs::default(), false),
         Some(Commands::Init) => init(),
+        Some(Commands::UpdateConfig) => update_config(),
         Some(Commands::Run(args)) => run_agent(&args, false),
         Some(Commands::Shell(args)) => run_shell(&args),
         Some(Commands::Up { services }) => compose_action("up", &services),
         Some(Commands::Down) => compose_action("down", &[]),
         Some(Commands::Doctor(args)) => doctor(&args),
         Some(Commands::Explain(args)) => run_agent(&args, true),
+        Some(Commands::Tui) => crate::tui::run(),
     }
 }
 
@@ -126,6 +139,31 @@ fn init() -> Result<u8> {
     Ok(0)
 }
 
+fn update_config() -> Result<u8> {
+    let repo_root = project::find_repo_root()?;
+    let update = Config::update(&repo_root)?;
+
+    println!("Updated {}", relative(&repo_root, &update.path));
+    println!(
+        "- Added: {}",
+        if update.added.is_empty() {
+            "none".into()
+        } else {
+            update.added.join(", ")
+        }
+    );
+    println!(
+        "- Removed deprecated: {}",
+        if update.removed.is_empty() {
+            "none".into()
+        } else {
+            update.removed.join(", ")
+        }
+    );
+    println!("- Backup: {}", relative(&repo_root, &update.backup_path));
+    Ok(0)
+}
+
 fn load_context(inspect_compose: bool) -> Result<AppContext> {
     let repo_root = project::find_repo_root()?;
     let loaded = Config::load(&repo_root)?;
@@ -134,7 +172,7 @@ fn load_context(inspect_compose: bool) -> Result<AppContext> {
         for warning in &loaded.warnings {
             eprintln!("- {warning}");
         }
-        eprintln!("Run `agentbox init` in a temporary directory to view the current schema.\n");
+        eprintln!("Run `agentbox update-config` to update the file to the current schema.\n");
     }
     let config = loaded.config;
     security::validate_config(&config)?;
@@ -179,27 +217,29 @@ fn load_context(inspect_compose: bool) -> Result<AppContext> {
 }
 
 fn run_agent(args: &RunArgs, explain: bool) -> Result<u8> {
-    let context = load_context(true)?;
+    let mut context = load_context(true)?;
     let command = agent_command(&context.config, args, &context.tools)?;
-    let spec = build_spec(&context, &args.allow_secrets, command, !explain)?;
-    print_banner(&context, &spec);
     if explain {
+        let spec = build_spec(&context, &args.allow_secrets, command, false)?;
+        print_banner(&context, &spec);
         println!("\n{}", docker::format_command(&spec));
         Ok(0)
     } else {
         ensure_docker_available()?;
-        ensure_compose_network(&context)?;
+        prepare_runtime_network(&mut context)?;
+        let spec = build_spec(&context, &args.allow_secrets, command, true)?;
+        print_banner(&context, &spec);
         docker::execute(&spec)
     }
 }
 
 fn run_shell(args: &SandboxArgs) -> Result<u8> {
-    let context = load_context(true)?;
+    let mut context = load_context(true)?;
     let shell = vec!["bash".into()];
+    ensure_docker_available()?;
+    prepare_runtime_network(&mut context)?;
     let spec = build_spec(&context, &args.allow_secrets, shell, true)?;
     print_banner(&context, &spec);
-    ensure_docker_available()?;
-    ensure_compose_network(&context)?;
     docker::execute(&spec)
 }
 
@@ -258,8 +298,57 @@ fn doctor(args: &SandboxArgs) -> Result<u8> {
 
 fn compose_action(action: &str, services: &[String]) -> Result<u8> {
     let context = load_context(false)?;
+    if action == "up" && !services.is_empty() {
+        select_up_services(&context.config, &[], services)?;
+    }
     ensure_docker_available()?;
+    let selected_services;
+    let services = if action == "up" && services.is_empty() && !context.config.headroom.enabled {
+        let available = compose::list_services(&context.repo_root, &context.compose_files)?;
+        let Some(selected) = select_up_services(&context.config, &available, services)? else {
+            println!(
+                "Headroom is disabled in {}; no Compose services to start.",
+                crate::config::CONFIG_FILE
+            );
+            return Ok(0);
+        };
+        selected_services = selected;
+        &selected_services
+    } else {
+        services
+    };
     compose::run_action(&context.repo_root, &context.compose_files, action, services)
+}
+
+fn select_up_services(
+    config: &Config,
+    available: &[String],
+    requested: &[String],
+) -> Result<Option<Vec<String>>> {
+    if config.headroom.enabled {
+        return Ok(Some(requested.to_vec()));
+    }
+
+    if requested
+        .iter()
+        .any(|service| service == &config.headroom.service)
+    {
+        anyhow::bail!(
+            "Compose service `{}` requires `headroom.enabled = true` in {}",
+            config.headroom.service,
+            crate::config::CONFIG_FILE
+        );
+    }
+    if !requested.is_empty() {
+        return Ok(Some(requested.to_vec()));
+    }
+
+    let services = available
+        .iter()
+        .filter(|service| *service != &config.headroom.service)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok((!services.is_empty()).then_some(services))
 }
 
 fn build_spec(
@@ -286,6 +375,9 @@ fn build_spec(
         environment.insert("ANTHROPIC_BASE_URL".into(), url.into());
         environment.insert("OPENAI_BASE_URL".into(), format!("{url}/v1"));
     }
+    let session_id = std::env::var("AGENTBOX_SESSION_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
     docker::build_run_spec(BuildInput {
         config: &context.config,
         repo_root: &context.repo_root,
@@ -294,6 +386,7 @@ fn build_spec(
         environment,
         command,
         interactive,
+        session_id: session_id.as_deref(),
     })
 }
 
@@ -477,13 +570,55 @@ fn ensure_docker_available() -> Result<()> {
     Ok(())
 }
 
-fn ensure_compose_network(context: &AppContext) -> Result<()> {
-    if context.config.network.mode == NetworkMode::Compose
-        && let Some(compose) = &context.compose
-    {
-        compose::ensure_network_exists(&compose.network)?;
+fn prepare_runtime_network(context: &mut AppContext) -> Result<()> {
+    if context.config.network.mode != NetworkMode::Compose {
+        return Ok(());
+    }
+    let Some(project) = &context.compose else {
+        return Ok(());
+    };
+
+    let network_exists = if context.config.headroom.enabled {
+        false
+    } else {
+        compose::network_exists(&project.network)?
+    };
+    match runtime_network_action(context.config.headroom.enabled, network_exists) {
+        RuntimeNetworkAction::StartHeadroom => {
+            let services = vec![context.config.headroom.service.clone()];
+            let status =
+                compose::run_action(&context.repo_root, &context.compose_files, "up", &services)?;
+            if status != 0 {
+                anyhow::bail!(
+                    "failed to start Headroom Compose service `{}`",
+                    context.config.headroom.service
+                );
+            }
+            compose::ensure_network_exists(&project.network)?;
+        }
+        RuntimeNetworkAction::UseCompose => {}
+        RuntimeNetworkAction::UseBridge => {
+            eprintln!(
+                "warning: Compose network `{}` is unavailable; using Docker bridge networking",
+                project.network
+            );
+            context.compose = None;
+        }
     }
     Ok(())
+}
+
+fn runtime_network_action(
+    headroom_enabled: bool,
+    compose_network_exists: bool,
+) -> RuntimeNetworkAction {
+    if headroom_enabled {
+        RuntimeNetworkAction::StartHeadroom
+    } else if compose_network_exists {
+        RuntimeNetworkAction::UseCompose
+    } else {
+        RuntimeNetworkAction::UseBridge
+    }
 }
 
 fn command_health(program: &str, args: &[&str]) -> String {
@@ -601,6 +736,97 @@ mod tests {
     fn bare_invocation_selects_default_run() {
         let cli = Cli::try_parse_from(["agentbox"]).unwrap();
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn update_config_subcommand_is_available() {
+        let cli = Cli::try_parse_from(["agentbox", "update-config"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::UpdateConfig)));
+    }
+
+    #[test]
+    fn tui_subcommand_is_available() {
+        let cli = Cli::try_parse_from(["agentbox", "tui"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Tui)));
+    }
+
+    #[test]
+    fn run_separator_passes_options_to_the_configured_agent() {
+        let cli = Cli::try_parse_from(["agentbox", "run", "--", "--no-alt-screen"]).unwrap();
+        let Some(Commands::Run(args)) = cli.command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(args.agent, None);
+        assert_eq!(args.arguments, ["--no-alt-screen"]);
+    }
+
+    #[test]
+    fn disabled_headroom_is_excluded_from_implicit_compose_up() {
+        let config = Config::default();
+        let available = vec!["app".into(), "headroom".into(), "db".into()];
+
+        let selected = select_up_services(&config, &available, &[])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected, ["app", "db"]);
+    }
+
+    #[test]
+    fn disabled_headroom_cannot_be_started_explicitly() {
+        let config = Config::default();
+        let error = select_up_services(&config, &["headroom".into()], &["headroom".into()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("headroom.enabled = true"));
+    }
+
+    #[test]
+    fn disabled_headroom_as_only_service_skips_compose_up() {
+        let config = Config::default();
+
+        assert!(
+            select_up_services(&config, &["headroom".into()], &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn enabled_headroom_preserves_default_compose_up() {
+        let mut config = Config::default();
+        config.headroom.enabled = true;
+
+        assert_eq!(
+            select_up_services(&config, &["headroom".into()], &[]).unwrap(),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn missing_compose_network_uses_bridge() {
+        assert_eq!(
+            runtime_network_action(false, false),
+            RuntimeNetworkAction::UseBridge
+        );
+    }
+
+    #[test]
+    fn existing_compose_network_is_reused() {
+        assert_eq!(
+            runtime_network_action(false, true),
+            RuntimeNetworkAction::UseCompose
+        );
+    }
+
+    #[test]
+    fn enabled_headroom_is_started_before_network_selection() {
+        assert_eq!(
+            runtime_network_action(true, false),
+            RuntimeNetworkAction::StartHeadroom
+        );
     }
 
     #[test]

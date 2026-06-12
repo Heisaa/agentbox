@@ -30,6 +30,7 @@ pub struct BuildInput<'a> {
     pub environment: BTreeMap<String, String>,
     pub command: Vec<String>,
     pub interactive: bool,
+    pub session_id: Option<&'a str>,
 }
 
 pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
@@ -45,9 +46,13 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         }
     }
 
+    let container_name = input
+        .session_id
+        .map(|id| format!("agentbox-{slug}-{}", container_suffix(id)))
+        .unwrap_or_else(|| format!("agentbox-{slug}"));
     args.extend([
         OsString::from("--name"),
-        OsString::from(format!("agentbox-{slug}")),
+        OsString::from(container_name),
         OsString::from("--user"),
         OsString::from(&uid_gid),
         OsString::from("--workdir"),
@@ -129,6 +134,10 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         "AGENTBOX_AUTO_UPDATE={}",
         u8::from(config.runtime.auto_update)
     )));
+    if let Some(agent) = update_agent(&input.command) {
+        args.push(OsString::from("--env"));
+        args.push(OsString::from(format!("AGENTBOX_UPDATE_AGENT={agent}")));
+    }
     args.push(OsString::from("--env"));
     args.push(OsString::from(format!(
         "AGENTBOX_CAVEMAN={}",
@@ -145,6 +154,37 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         workspace_write: config.workspace.write,
         uid_gid,
     })
+}
+
+fn container_suffix(value: &str) -> String {
+    let suffix = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let suffix = suffix
+        .trim_matches('-')
+        .chars()
+        .take(40)
+        .collect::<String>();
+    if suffix.is_empty() {
+        "session".into()
+    } else {
+        suffix
+    }
+}
+
+fn update_agent(command: &[String]) -> Option<&'static str> {
+    match command.first().map(String::as_str) {
+        Some("claude") => Some("claude"),
+        Some("codex") => Some("codex"),
+        _ => None,
+    }
 }
 
 fn add_volume(args: &mut Vec<OsString>, source: &str, target: &str) {
@@ -234,12 +274,14 @@ mod tests {
             environment: BTreeMap::new(),
             command: vec!["sh".into()],
             interactive: false,
+            session_id: None,
         })
         .unwrap();
         let rendered = format_command(&spec);
         assert!(!rendered.contains("/var/run/docker.sock"));
         assert!(rendered.contains("HOME=/home/agent"));
         assert!(rendered.contains("AGENTBOX_AUTO_UPDATE=1"));
+        assert!(!rendered.contains("AGENTBOX_UPDATE_AGENT="));
         assert!(rendered.contains("AGENTBOX_CAVEMAN=0"));
         assert!(rendered.contains("--cap-drop ALL"));
         assert!(rendered.contains("--network bridge"));
@@ -260,6 +302,7 @@ mod tests {
             environment: BTreeMap::new(),
             command: vec!["true".into()],
             interactive: false,
+            session_id: None,
         })
         .unwrap();
         assert!(format_command(&spec).contains(",readonly"));
@@ -278,10 +321,46 @@ mod tests {
             environment: BTreeMap::new(),
             command: vec!["true".into()],
             interactive: false,
+            session_id: None,
         })
         .unwrap();
 
         assert!(format_command(&spec).contains("AGENTBOX_AUTO_UPDATE=0"));
+    }
+
+    #[test]
+    fn only_the_started_agent_is_selected_for_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::default();
+
+        for (command, expected, unexpected) in [
+            (
+                "claude",
+                "AGENTBOX_UPDATE_AGENT=claude",
+                "AGENTBOX_UPDATE_AGENT=codex",
+            ),
+            (
+                "codex",
+                "AGENTBOX_UPDATE_AGENT=codex",
+                "AGENTBOX_UPDATE_AGENT=claude",
+            ),
+        ] {
+            let spec = build_run_spec(BuildInput {
+                config: &config,
+                repo_root: temp.path(),
+                workspace: temp.path(),
+                compose: None,
+                environment: BTreeMap::new(),
+                command: vec![command.into()],
+                interactive: false,
+                session_id: None,
+            })
+            .unwrap();
+            let rendered = format_command(&spec);
+
+            assert!(rendered.contains(expected));
+            assert!(!rendered.contains(unexpected));
+        }
     }
 
     #[test]
@@ -297,10 +376,17 @@ mod tests {
             environment: BTreeMap::new(),
             command: vec!["true".into()],
             interactive: false,
+            session_id: None,
         })
         .unwrap();
 
         assert!(format_command(&spec).contains("AGENTBOX_CAVEMAN=1"));
+    }
+
+    #[test]
+    fn tui_session_ids_are_safe_container_suffixes() {
+        assert_eq!(container_suffix("TUI 42/../../"), "tui-42");
+        assert_eq!(container_suffix("***"), "session");
     }
 
     #[test]
@@ -319,6 +405,7 @@ mod tests {
             environment,
             command: vec!["true".into()],
             interactive: false,
+            session_id: None,
         })
         .unwrap();
 

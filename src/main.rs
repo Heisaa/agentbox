@@ -4,6 +4,7 @@ mod config;
 mod docker;
 mod project;
 mod security;
+mod tui;
 
 use std::process::ExitCode;
 

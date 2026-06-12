@@ -1,0 +1,56 @@
+version = 1
+
+[agent]
+command = "claude"
+default = "claude"
+home = "persistent"
+
+[caches]
+cargo = true
+npm = true
+pip = true
+pnpm = true
+
+[caveman]
+enabled = false
+level = "full"
+
+[env]
+allow = [
+    "NODE_ENV",
+    "RUST_LOG",
+]
+file = ".agentbox/env"
+
+[env.defaults]
+NODE_ENV = "development"
+
+[headroom]
+enabled = false
+service = "headroom"
+url = "http://headroom:8787"
+
+[limits]
+cpus = 4.0
+memory = "8g"
+
+[network]
+compose_files = ["compose.yaml"]
+compose_network = ""
+internet = true
+mode = "compose"
+
+[runtime]
+auto_update = true
+image = "agentbox/fullstack:latest"
+
+[security]
+allow_host_network = false
+mount_docker_socket = false
+mount_host_home = false
+pass_ssh_agent = false
+
+[workspace]
+container_path = "/workspace"
+mount = "."
+write = true
