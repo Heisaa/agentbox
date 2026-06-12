@@ -28,13 +28,18 @@ use crossterm::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-use crate::{config::Config, project};
+use crate::{config::Config, docker, project};
 
 const SIDEBAR_WIDTH: u16 = 28;
 const SCROLLBACK_ROWS_PER_TICK: usize = 3;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STATUS_SUBMIT_DELAY: Duration = Duration::from_millis(100);
-const STATUS_CAPTURE_DELAY: Duration = Duration::from_millis(1200);
+const STATUS_DISMISS_DELAY: Duration = Duration::from_millis(100);
+const STATUS_CAPTURE_DELAY: Duration = Duration::from_secs(2);
+const STATUS_INITIAL_DELAY: Duration = Duration::from_secs(5);
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const STATUS_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentKind {
@@ -104,10 +109,7 @@ struct Session {
     agent: AgentKind,
     terminal: PtyProcess,
     selection: Option<Selection>,
-    status_summary: String,
-    status_detail: String,
-    status_submit_pending: Option<Instant>,
-    status_pending: Option<Instant>,
+    status: StatusMonitor,
 }
 
 struct PtyProcess {
@@ -117,6 +119,35 @@ struct PtyProcess {
     parser: Arc<Mutex<vt100::Parser>>,
     dirty: Arc<AtomicBool>,
     exited: Option<u32>,
+}
+
+struct StatusMonitor {
+    agent: AgentKind,
+    container: String,
+    workdir: String,
+    terminal: Option<PtyProcess>,
+    phase: StatusPhase,
+    next_refresh: Instant,
+    has_capture: bool,
+    retry_attempted: bool,
+    summary: String,
+    detail: String,
+}
+
+enum StatusPhase {
+    Idle,
+    WaitingForReady(Instant),
+    Dismissing(Instant),
+    SubmitPending(Instant),
+    Capturing(Instant),
+    RetryPending(Instant),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StatusRead {
+    Success(String),
+    Retry,
+    Failed,
 }
 
 impl PtyProcess {
@@ -252,15 +283,205 @@ impl PtyProcess {
     }
 }
 
+impl StatusMonitor {
+    fn new(agent: AgentKind, container: String, workdir: String) -> Self {
+        let summary = if agent.command().is_some() {
+            String::new()
+        } else {
+            "usage unavailable for custom agent".into()
+        };
+        Self {
+            agent,
+            container,
+            workdir,
+            terminal: None,
+            phase: StatusPhase::Idle,
+            next_refresh: Instant::now() + STATUS_INITIAL_DELAY,
+            has_capture: false,
+            retry_attempted: false,
+            summary,
+            detail: String::new(),
+        }
+    }
+
+    fn request_refresh(&mut self) {
+        if matches!(self.phase, StatusPhase::Idle) {
+            self.next_refresh = Instant::now();
+        }
+    }
+
+    fn poll(&mut self) -> bool {
+        if self.agent.command().is_none() {
+            return false;
+        }
+
+        let now = Instant::now();
+        if self.terminal.is_none() {
+            if now < self.next_refresh {
+                return false;
+            }
+            let command = status_process_command(&self.container, &self.workdir, self.agent);
+            match PtyProcess::spawn(command, 40, 100) {
+                Ok(terminal) => {
+                    self.terminal = Some(terminal);
+                    self.phase = StatusPhase::WaitingForReady(now);
+                    return true;
+                }
+                Err(error) => {
+                    self.summary = format!("usage checker unavailable: {error}");
+                    self.detail = format!("{error:#}");
+                    self.next_refresh = now + STATUS_POLL_INTERVAL;
+                    return true;
+                }
+            }
+        }
+
+        let exited = self
+            .terminal
+            .as_mut()
+            .is_some_and(|terminal| terminal.poll() && terminal.exited.is_some());
+        if exited {
+            let code = self
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.exited)
+                .unwrap_or(1);
+            let contents = self.contents();
+            self.summary = format!("usage checker exited with code {code}");
+            self.detail = status_detail(&contents);
+            self.terminal = None;
+            self.phase = StatusPhase::Idle;
+            self.next_refresh = now + STATUS_POLL_INTERVAL;
+            return true;
+        }
+
+        match self.phase {
+            StatusPhase::Idle if now >= self.next_refresh => {
+                self.retry_attempted = false;
+                if self.has_capture {
+                    self.write(b"\x1b");
+                    self.phase = StatusPhase::Dismissing(now);
+                } else {
+                    self.submit(now);
+                }
+                true
+            }
+            StatusPhase::WaitingForReady(_)
+                if status_screen_ready(self.agent, &self.contents()) =>
+            {
+                self.retry_attempted = false;
+                self.submit(now);
+                true
+            }
+            StatusPhase::WaitingForReady(started) if started.elapsed() >= STATUS_READY_TIMEOUT => {
+                let contents = self.contents();
+                self.summary = "usage checker did not reach an input prompt".into();
+                self.detail = status_detail(&contents);
+                if let Some(terminal) = &mut self.terminal {
+                    let _ = terminal.terminate();
+                }
+                self.terminal = None;
+                self.phase = StatusPhase::Idle;
+                self.next_refresh = now + STATUS_POLL_INTERVAL;
+                true
+            }
+            StatusPhase::Dismissing(started) if started.elapsed() >= STATUS_DISMISS_DELAY => {
+                self.submit(now);
+                true
+            }
+            StatusPhase::SubmitPending(started)
+                if started.elapsed() >= CODEX_STATUS_SUBMIT_DELAY =>
+            {
+                self.write(b"\r");
+                self.phase = StatusPhase::Capturing(now);
+                true
+            }
+            StatusPhase::Capturing(started) if started.elapsed() >= STATUS_CAPTURE_DELAY => {
+                let contents = self.contents();
+                self.has_capture = true;
+                match read_status(&contents, self.retry_attempted) {
+                    StatusRead::Success(summary) => {
+                        self.summary = summary;
+                        self.detail = status_detail(&contents);
+                        self.phase = StatusPhase::Idle;
+                    }
+                    StatusRead::Retry => {
+                        self.retry_attempted = true;
+                        self.phase = StatusPhase::RetryPending(now);
+                    }
+                    StatusRead::Failed => {
+                        let command = self
+                            .agent
+                            .command()
+                            .expect("known agent has a status command");
+                        self.summary = format!("could not read {command} response");
+                        self.detail = status_detail(&contents);
+                        self.phase = StatusPhase::Idle;
+                    }
+                }
+                true
+            }
+            StatusPhase::RetryPending(started) if started.elapsed() >= STATUS_RETRY_DELAY => {
+                self.write(b"\x1b");
+                self.phase = StatusPhase::Dismissing(now);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn submit(&mut self, now: Instant) {
+        let command = self
+            .agent
+            .command()
+            .expect("known agent has a status command");
+        self.next_refresh = now + STATUS_POLL_INTERVAL;
+        if self.agent.status_submit_delay().is_some() {
+            self.write(command.as_bytes());
+            self.phase = StatusPhase::SubmitPending(now);
+        } else {
+            self.write(format!("{command}\r").as_bytes());
+            self.phase = StatusPhase::Capturing(now);
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.write(bytes);
+        }
+    }
+
+    fn contents(&self) -> String {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| terminal.parser.lock().ok())
+            .map(|parser| parser.screen().contents())
+            .unwrap_or_default()
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.terminate()?;
+        }
+        Ok(())
+    }
+}
+
 impl Session {
     fn spawn(repo: &Path, rows: u16, cols: u16, sequence: usize) -> Result<Self> {
         let repo = project::find_repo_root_from(repo)?;
         let loaded = Config::load(&repo)?;
         let agent = classify_agent(&loaded.config.agent.command, &loaded.config.agent.default);
         let executable = std::env::current_exe().context("failed to locate agentbox executable")?;
-        let command = session_command(&executable, &repo, sequence, agent);
+        let session_id = format!("tui-{}-{sequence}", process::id());
+        let command = session_command(&executable, &repo, &session_id, agent);
         let terminal = PtyProcess::spawn(command, rows, cols)
             .with_context(|| format!("failed to start agentbox in {}", repo.display()))?;
+        let status = StatusMonitor::new(
+            agent,
+            docker::container_name(&repo, Some(&session_id)),
+            loaded.config.workspace.container_path,
+        );
         let name = repo
             .file_name()
             .and_then(|name| name.to_str())
@@ -273,10 +494,7 @@ impl Session {
             agent,
             terminal,
             selection: None,
-            status_summary: "usage not checked".into(),
-            status_detail: String::new(),
-            status_submit_pending: None,
-            status_pending: None,
+            status,
         })
     }
 
@@ -292,50 +510,11 @@ impl Session {
     }
 
     fn refresh_status(&mut self) {
-        if self.status_submit_pending.is_some() {
-            return;
-        }
-        let Some(command) = self.agent.command() else {
-            self.status_summary = "usage unavailable for custom agent".into();
-            return;
-        };
-        self.status_pending = None;
-        if let Some(delay) = self.agent.status_submit_delay() {
-            // Codex must process the slash command before receiving Enter.
-            self.write_input(command.as_bytes());
-            self.status_submit_pending = Some(Instant::now() + delay);
-        } else {
-            self.write_input(format!("{command}\r").as_bytes());
-            self.status_submit_pending = None;
-            self.status_pending = Some(Instant::now());
-        }
-        self.status_summary = format!("checking {command}...");
+        self.status.request_refresh();
     }
 
     fn poll(&mut self) -> bool {
-        let mut changed = self.terminal.poll();
-        if self
-            .status_submit_pending
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.write_input(b"\r");
-            self.status_submit_pending = None;
-            self.status_pending = Some(Instant::now());
-            changed = true;
-        }
-        if self
-            .status_pending
-            .is_some_and(|started| started.elapsed() >= STATUS_CAPTURE_DELAY)
-        {
-            if let Ok(parser) = self.terminal.parser.lock() {
-                let contents = parser.screen().contents();
-                self.status_summary = summarize_status(&contents);
-                self.status_detail = status_detail(&contents);
-            }
-            self.status_pending = None;
-            changed = true;
-        }
-        changed
+        self.terminal.poll() | self.status.poll()
     }
 
     fn mouse_scroll(&mut self, up: bool, column: u16, row: u16, modifiers: KeyModifiers) {
@@ -621,6 +800,7 @@ pub fn run() -> Result<u8> {
     }
 
     for session in &mut app.sessions {
+        let _ = session.status.terminate();
         session.terminal.terminate()?;
     }
     if let Overlay::Lazygit(lazygit) = &mut app.overlay {
@@ -1070,7 +1250,7 @@ fn draw_footer(stdout: &mut Stdout, app: &App, sidebar: u16) -> Result<()> {
     } else {
         (
             session
-                .map(|session| session.status_summary.clone())
+                .map(|session| session.status.summary.clone())
                 .unwrap_or_else(|| "no session".into()),
             Color::DarkGrey,
         )
@@ -1164,9 +1344,9 @@ fn draw_status(stdout: &mut Stdout, app: &App) -> Result<()> {
     let detail = app
         .sessions
         .get(app.selected)
-        .map(|session| session.status_detail.as_str())
+        .map(|session| session.status.detail.as_str())
         .filter(|detail| !detail.is_empty())
-        .unwrap_or("No captured status yet. Press F5, then open this view again.");
+        .unwrap_or("No captured usage/status yet.");
     for (index, line) in detail
         .lines()
         .take(height.saturating_sub(3) as usize)
@@ -1196,7 +1376,7 @@ fn draw_help(stdout: &mut Stdout, app: &App) -> Result<()> {
         "Ctrl-N  open a session in another repository",
         "F6      switch to the next session",
         "F3      open host lazygit in the active repository",
-        "F5      run /usage (Claude) or /status (Codex)",
+        "F5      refresh usage/status now",
         "F2      show the last captured usage/status view",
         "Ctrl-Q  exit the TUI",
         "",
@@ -1251,7 +1431,7 @@ fn lazygit_command(repo: &Path) -> CommandBuilder {
 fn session_command(
     executable: &Path,
     repo: &Path,
-    sequence: usize,
+    session_id: &str,
     agent: AgentKind,
 ) -> CommandBuilder {
     let mut command = CommandBuilder::new(executable);
@@ -1262,10 +1442,39 @@ fn session_command(
     }
     command.cwd(repo);
     command.env("TERM", "xterm-256color");
-    command.env(
-        "AGENTBOX_SESSION_ID",
-        format!("tui-{}-{sequence}", process::id()),
-    );
+    command.env("AGENTBOX_SESSION_ID", session_id);
+    command
+}
+
+fn status_process_command(container: &str, workdir: &str, agent: AgentKind) -> CommandBuilder {
+    let mut command = CommandBuilder::new("docker");
+    command.args([
+        "exec",
+        "-i",
+        "-t",
+        "-e",
+        "TERM=xterm-256color",
+        "-w",
+        workdir,
+        container,
+        "/bin/sh",
+        "-c",
+        r#"PATH="$HOME/.agentbox/npm/bin:$PATH"; export PATH; exec "$@""#,
+        "agentbox-status",
+    ]);
+    match agent {
+        AgentKind::Claude => {
+            command.args(["claude", "--dangerously-skip-permissions"]);
+        }
+        AgentKind::Codex => {
+            command.args([
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--no-alt-screen",
+            ]);
+        }
+        AgentKind::Other => {}
+    }
     command
 }
 
@@ -1326,19 +1535,68 @@ fn classify_agent(command: &str, default: &str) -> AgentKind {
     }
 }
 
-fn summarize_status(contents: &str) -> String {
-    let relevant = contents
+fn parse_usage_summary(contents: &str) -> Option<String> {
+    let lines = contents
         .lines()
-        .map(str::trim)
-        .rfind(|line| {
-            let lowercase = line.to_ascii_lowercase();
-            !line.is_empty()
-                && ["usage", "context", "token", "limit", "model", "remaining"]
-                    .iter()
-                    .any(|keyword| lowercase.contains(keyword))
-        })
-        .unwrap_or("status captured");
-    truncate(relevant, 120)
+        .map(|line| line.trim().trim_matches('│').trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if let Some(line) = lines
+        .iter()
+        .find(|line| is_five_hour_label(line) && compact_usage_value(line).is_some())
+    {
+        return Some(truncate(line, 120));
+    }
+
+    if let Some(index) = lines
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("current session"))
+        && let Some(usage) = lines[index + 1..]
+            .iter()
+            .take_while(|line| !line.to_ascii_lowercase().starts_with("current week"))
+            .find_map(|line| compact_usage_value(line))
+    {
+        return Some(truncate(&format!("Current session: {usage}"), 120));
+    }
+
+    None
+}
+
+fn read_status(contents: &str, retry_attempted: bool) -> StatusRead {
+    match parse_usage_summary(contents) {
+        Some(summary) => StatusRead::Success(summary),
+        None if retry_attempted => StatusRead::Failed,
+        None => StatusRead::Retry,
+    }
+}
+
+fn is_five_hour_label(line: &str) -> bool {
+    let lowercase = line.to_ascii_lowercase();
+    [
+        "5h limit",
+        "5 hour limit",
+        "5-hour limit",
+        "five hour limit",
+    ]
+    .iter()
+    .any(|label| lowercase.contains(label))
+}
+
+fn compact_usage_value(line: &str) -> Option<&str> {
+    let percent = line.find('%')?;
+    let start = line[..percent]
+        .rfind(|character: char| !character.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    Some(line[start..].trim())
+}
+
+fn status_screen_ready(agent: AgentKind, contents: &str) -> bool {
+    match agent {
+        AgentKind::Claude => contents.contains("Claude Code") && contents.contains('❯'),
+        AgentKind::Codex => contents.contains("OpenAI Codex") && contents.contains('›'),
+        AgentKind::Other => false,
+    }
 }
 
 fn status_detail(contents: &str) -> String {
@@ -1524,9 +1782,48 @@ mod tests {
     }
 
     #[test]
-    fn status_summary_prefers_relevant_lines() {
+    fn status_summary_rejects_output_without_usage_value() {
         let status = "header\nModel: codex\nContext remaining: 72%\nprompt";
-        assert_eq!(summarize_status(status), "Context remaining: 72%");
+        assert_eq!(parse_usage_summary(status), None);
+    }
+
+    #[test]
+    fn incomplete_status_is_retried_only_once() {
+        let codex = "5h limit:\nWeekly limit: 84% left";
+        let claude = "Current session\nCurrent week (all models)\n55% used";
+
+        assert_eq!(read_status(codex, false), StatusRead::Retry);
+        assert_eq!(read_status(codex, true), StatusRead::Failed);
+        assert_eq!(read_status(claude, false), StatusRead::Retry);
+        assert_eq!(read_status(claude, true), StatusRead::Failed);
+    }
+
+    #[test]
+    fn status_summary_prefers_codex_five_hour_limit_over_weekly_limit() {
+        let status = "\
+│  5h limit: [█████████████████░░░] 87% left (resets 19:37) │\n\
+│  Weekly limit: [█████████████████░░░] 84% left             │\n\
+│  (resets 08:50 on 18 Jun)                                  │";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("5h limit: [█████████████████░░░] 87% left (resets 19:37)".into())
+        );
+    }
+
+    #[test]
+    fn status_summary_maps_claude_current_session_to_five_hour_usage() {
+        let status = "\
+Current session\n\
+██████████████████████████████████▌ 69% used\n\
+Resets 6:10pm (UTC)\n\
+Current week (all models)\n\
+███████████████████████████▌ 55% used";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("Current session: 69% used".into())
+        );
     }
 
     #[test]
@@ -1736,7 +2033,7 @@ mod tests {
         let command = session_command(
             Path::new("/usr/bin/agentbox"),
             Path::new("/tmp/example-repo"),
-            7,
+            "tui-123-7",
             AgentKind::Codex,
         );
 
@@ -1744,6 +2041,85 @@ mod tests {
             command.get_argv(),
             &["/usr/bin/agentbox", "run", "--", "--no-alt-screen"]
         );
+        assert_eq!(
+            command
+                .get_env("AGENTBOX_SESSION_ID")
+                .and_then(|value| value.to_str()),
+            Some("tui-123-7")
+        );
+    }
+
+    #[test]
+    fn status_processes_run_inside_the_session_container_without_a_prompt() {
+        let claude = status_process_command("agentbox-demo-tui-1", "/workspace", AgentKind::Claude);
+        assert_eq!(
+            claude.get_argv(),
+            &[
+                "docker",
+                "exec",
+                "-i",
+                "-t",
+                "-e",
+                "TERM=xterm-256color",
+                "-w",
+                "/workspace",
+                "agentbox-demo-tui-1",
+                "/bin/sh",
+                "-c",
+                r#"PATH="$HOME/.agentbox/npm/bin:$PATH"; export PATH; exec "$@""#,
+                "agentbox-status",
+                "claude",
+                "--dangerously-skip-permissions",
+            ]
+        );
+
+        let codex = status_process_command("agentbox-demo-tui-1", "/workspace", AgentKind::Codex);
+        assert_eq!(
+            codex.get_argv(),
+            &[
+                "docker",
+                "exec",
+                "-i",
+                "-t",
+                "-e",
+                "TERM=xterm-256color",
+                "-w",
+                "/workspace",
+                "agentbox-demo-tui-1",
+                "/bin/sh",
+                "-c",
+                r#"PATH="$HOME/.agentbox/npm/bin:$PATH"; export PATH; exec "$@""#,
+                "agentbox-status",
+                "codex",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--no-alt-screen",
+            ]
+        );
+    }
+
+    #[test]
+    fn status_checks_use_only_local_slash_commands() {
+        assert_eq!(AgentKind::Claude.command(), Some("/usage"));
+        assert_eq!(AgentKind::Codex.command(), Some("/status"));
+        assert_eq!(STATUS_INITIAL_DELAY, Duration::from_secs(5));
+        assert_eq!(STATUS_POLL_INTERVAL, Duration::from_secs(30));
+        assert_eq!(STATUS_RETRY_DELAY, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn status_checker_waits_for_each_agent_ui() {
+        assert!(status_screen_ready(
+            AgentKind::Claude,
+            "Welcome to Claude Code\n❯"
+        ));
+        assert!(status_screen_ready(
+            AgentKind::Codex,
+            "OpenAI Codex (v1.2.3)\n›"
+        ));
+        assert!(!status_screen_ready(
+            AgentKind::Codex,
+            "OpenAI Codex (v1.2.3)"
+        ));
     }
 
     #[test]

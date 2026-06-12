@@ -55,9 +55,14 @@ Running `agentbox` without a subcommand starts the configured default agent.
 `agentbox tui` opens a multi-session terminal interface. The left sidebar lists
 active sessions, and `Ctrl-N` opens a session in another repository. Use `F6`
 to switch sessions, `F3` to open the host's `lazygit` in the active repository,
-`F5` to run Claude's `/usage` or Codex's `/status`, and `F2` to open the
-captured detail view. Closing `lazygit` returns to the agent view. The latest
-status is shown subtly below the active terminal. Conversation history scrolls
+`F5` to refresh usage immediately, and `F2` to open the captured detail view.
+Usage is fetched automatically every 30 seconds by a hidden process in the
+session container. It invokes only Claude's `/usage` or Codex's `/status`
+built-in command, so it does not submit a model prompt or consume model tokens.
+The first check waits five seconds for the session container to start. Closing
+`lazygit` returns to the agent view. The 5-hour usage window is shown subtly
+below the active terminal; `F2` retains the complete status, including weekly
+usage. Conversation history scrolls
 with the mouse wheel or Page Up/Down without triggering prompt history; the
 view stays anchored while the agent streams output, and `End` jumps back to
 the live view. Drag with the left mouse button to select text in the

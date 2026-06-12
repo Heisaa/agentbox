@@ -46,10 +46,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         }
     }
 
-    let container_name = input
-        .session_id
-        .map(|id| format!("agentbox-{slug}-{}", container_suffix(id)))
-        .unwrap_or_else(|| format!("agentbox-{slug}"));
+    let container_name = container_name(input.repo_root, input.session_id);
     args.extend([
         OsString::from("--name"),
         OsString::from(container_name),
@@ -177,6 +174,13 @@ fn container_suffix(value: &str) -> String {
     } else {
         suffix
     }
+}
+
+pub(crate) fn container_name(repo_root: &Path, session_id: Option<&str>) -> String {
+    let slug = crate::project::project_slug(repo_root);
+    session_id
+        .map(|id| format!("agentbox-{slug}-{}", container_suffix(id)))
+        .unwrap_or_else(|| format!("agentbox-{slug}"))
 }
 
 fn update_agent(command: &[String]) -> Option<&'static str> {
@@ -387,6 +391,10 @@ mod tests {
     fn tui_session_ids_are_safe_container_suffixes() {
         assert_eq!(container_suffix("TUI 42/../../"), "tui-42");
         assert_eq!(container_suffix("***"), "session");
+        assert_eq!(
+            container_name(Path::new("/tmp/My Project"), Some("TUI 42/../../")),
+            "agentbox-my-project-tui-42"
+        );
     }
 
     #[test]
