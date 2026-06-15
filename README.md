@@ -156,9 +156,11 @@ to be used directly without a build.
 
 Agentbox detects Rust projects and JavaScript package managers from common
 manifest and lock files. Claude and Codex receive instructions to run relevant
-verification commands. When pnpm is indicated by `packageManager`,
-`pnpm-lock.yaml`, or `pnpm-workspace.yaml`, they are explicitly instructed to
-use pnpm rather than npm or Yarn.
+verification commands that cannot resolve or download dependencies. When pnpm
+is indicated by `packageManager`, `pnpm-lock.yaml`, or `pnpm-workspace.yaml`,
+they are instructed to use pnpm for existing scripts rather than npm or Yarn.
+Commands that may fetch, install, update, or newly resolve third-party
+dependencies must be handed back to the user to run.
 
 The injected agent guidance is maintained in
 [`instructions/agent.md`](instructions/agent.md). Edit that template to change

@@ -41,6 +41,15 @@ limitations or safety requirements below.
   shared or production, do not run the command; explain the blocker.
 - Never weaken security controls, expose credentials, or print secret values to
   work around a sandbox limitation.
+- Never run a command that may fetch, install, update, or newly resolve
+  third-party packages or dependencies because it may introduce or execute
+  untrusted supply-chain content. This includes install, add, update, sync, and
+  upgrade commands from package managers such as npm, pnpm, Yarn, Bun, pip, uv,
+  Cargo, Bundler, and Composer. It also includes build, test, or script commands
+  when required dependencies are not already available locally and the command
+  may download them. If such a command is needed, pause the current task and ask
+  the user to run the exact command themselves. Continue only after the user
+  confirms that it completed.
 - Verify changes with the project's relevant tests, linters, formatters, and
   build checks before reporting completion. If verification cannot run, state
   exactly what was unavailable and what remains unverified.

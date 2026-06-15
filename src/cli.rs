@@ -588,15 +588,16 @@ fn project_guidance(config: &Config, tools: &ProjectTools) -> String {
         .as_ref()
         .map(|manager| {
             format!(
-            "This project uses {manager}; use {manager} for dependency installation and package \
-             scripts instead of another JavaScript package manager."
+            "This project uses {manager}; use {manager} for existing package scripts instead of \
+             another JavaScript package manager. Do not install or update dependencies yourself."
             )
         })
         .unwrap_or_default();
     let rust = if tools.rust {
         String::from(
             "This is a Rust project with cargo and rustc available. When relevant, run cargo fmt \
-             --check, cargo check, cargo test, and cargo clippy.",
+             --check. Do not run cargo check, test, clippy, build, install, update, or other \
+             dependency-resolving commands; ask the user to run the exact command instead.",
         )
     } else {
         String::new()
@@ -1020,7 +1021,10 @@ mod tests {
         );
         assert!(!guidance.contains("{{"));
         assert!(guidance.contains("uses pnpm"));
-        assert!(guidance.contains("cargo clippy"));
+        assert!(guidance.contains("Never run a command that may fetch, install, update"));
+        assert!(guidance.contains("ask the user to run the exact command themselves"));
+        assert!(guidance.contains("Do not install or update dependencies yourself"));
+        assert!(guidance.contains("Do not run cargo check, test, clippy"));
         assert!(guidance.contains("\n## Environment limitations\n"));
         assert!(guidance.contains("Docker and Docker Compose may be unavailable"));
     }
