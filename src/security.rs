@@ -40,6 +40,11 @@ pub fn validate_config(config: &Config) -> Result<()> {
     if config.runtime.image.trim().is_empty() {
         anyhow::bail!("runtime.image must not be empty");
     }
+    if config.runtime.image.trim_start().starts_with('-') {
+        anyhow::bail!(
+            "runtime.image must not start with '-'; a leading dash would be parsed by docker as a flag"
+        );
+    }
     if !config.runtime.dockerfile.as_os_str().is_empty()
         && config.runtime.build_context.as_os_str().is_empty()
     {
@@ -236,6 +241,19 @@ mod tests {
     #[test]
     fn rejects_root_mount() {
         assert!(validate_workspace_path(Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn rejects_image_reference_that_could_be_parsed_as_a_flag() {
+        let mut config = Config::default();
+        config.runtime.image = "--privileged".into();
+
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("must not start with '-'")
+        );
     }
 
     #[test]

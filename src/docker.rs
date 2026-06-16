@@ -73,6 +73,8 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         OsString::from(&config.limits.memory),
         OsString::from("--cpus"),
         OsString::from(config.limits.cpus.to_string()),
+        OsString::from("--pids-limit"),
+        OsString::from(config.limits.pids.to_string()),
         OsString::from("--security-opt"),
         OsString::from("no-new-privileges"),
         OsString::from("--cap-drop"),
@@ -196,6 +198,9 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     )));
 
     let runtime_image = runtime_image(config, input.repo_root);
+    // Terminate option parsing so a repo-supplied image reference cannot be
+    // interpreted by `docker run` as an additional flag (e.g. `--privileged`).
+    args.push(OsString::from("--"));
     args.push(OsString::from(&runtime_image));
     args.extend(input.command.iter().map(OsString::from));
 
@@ -566,6 +571,7 @@ fn cargo_cache_init_args(spec: &RunSpec) -> Vec<OsString> {
         "type=volume,src=agentbox-cargo-cache,dst=/cache".into(),
         "--entrypoint".into(),
         "/bin/sh".into(),
+        "--".into(),
         spec.runtime_image.clone().into(),
         "-c".into(),
         r#"owner="$(stat -c '%u:%g' /cache)"; if [ "$owner" != "$1" ]; then chown -R "$1" /cache; fi"#.into(),
@@ -634,7 +640,10 @@ mod tests {
         assert!(!rendered.contains("AGENTBOX_UPDATE_AGENT="));
         assert!(rendered.contains("AGENTBOX_CAVEMAN=0"));
         assert!(rendered.contains("--cap-drop ALL"));
+        assert!(rendered.contains("--pids-limit 2048"));
         assert!(rendered.contains("--network bridge"));
+        // The image must be guarded by a `--` option terminator.
+        assert!(rendered.contains(&format!("-- {}", spec.runtime_image)));
         assert!(rendered.contains("type=bind,src="));
         if Path::new("/etc/localtime").is_file() {
             assert!(rendered.contains("src=/etc/localtime,dst=/etc/localtime,readonly"));
@@ -908,6 +917,7 @@ mod tests {
         assert!(rendered.contains("--network none"));
         assert!(rendered.contains("--cap-drop ALL --cap-add CHOWN"));
         assert!(rendered.contains("--user 0:0"));
+        assert!(rendered.contains(&format!("-- {}", spec.runtime_image)));
         assert!(rendered.contains("agentbox-cargo-cache"));
         assert!(rendered.ends_with(&spec.uid_gid));
     }

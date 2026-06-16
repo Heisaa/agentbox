@@ -73,20 +73,22 @@ restart with `--continue` and Codex tabs restart with `resume --last`, using the
 per-project persistent agent home. The selected agent is saved with each tab.
 Custom agents restart normally because Agentbox cannot infer a generic resume
 command. Any labeled containers left by a crash are removed before the saved
-sessions restart. `Ctrl-W` closes the active session and removes it from the
-saved tabs; `Ctrl-C` is an equivalent shortcut.
+sessions restart. `Ctrl-W` closes the active session immediately and removes it
+from the saved tabs. The first `Ctrl-C` is sent to the active agent so it can
+clear its input; press `Ctrl-C` again to close the Agentbox session.
 
 Containers use the host timezone. Agentbox mounts `/etc/localtime` read-only and
 sets `TZ` when it can determine the host's IANA timezone name.
 
 Use `Ctrl-J` and `Ctrl-K` to move down and up through the session list. `F6`
 still cycles to the next session. Use `F3` to open the host's `lazygit` in the active
-repository, `F5` to refresh usage immediately, and `F2` to open the captured
+repository, `F5` to request a usage refresh, and `F2` to open the captured
 detail view.
-Usage is fetched automatically every 30 seconds by a hidden process in the
-session container. It invokes only Claude's `/usage` or Codex's `/status`
-built-in command, so it does not submit a model prompt or consume model tokens.
-The first check waits five seconds for the session container to start. Closing
+Usage is fetched automatically every two minutes by a hidden process in the
+session container, and checks pause for 15 minutes when rate limiting is
+detected. It invokes only Claude's `/usage` or Codex's `/status` built-in
+command, so it does not submit a model prompt or consume model tokens. The
+first check waits five seconds for the session container to start. Closing
 `lazygit` returns to the agent view. The 5-hour usage window is shown subtly
 below the active terminal in a compact form such as
 `50% left, resets 19:30`; `F2` retains the complete status, including weekly
@@ -156,11 +158,9 @@ to be used directly without a build.
 
 Agentbox detects Rust projects and JavaScript package managers from common
 manifest and lock files. Claude and Codex receive instructions to run relevant
-verification commands that cannot resolve or download dependencies. When pnpm
-is indicated by `packageManager`, `pnpm-lock.yaml`, or `pnpm-workspace.yaml`,
-they are instructed to use pnpm for existing scripts rather than npm or Yarn.
-Commands that may fetch, install, update, or newly resolve third-party
-dependencies must be handed back to the user to run.
+verification commands. When pnpm is indicated by `packageManager`,
+`pnpm-lock.yaml`, or `pnpm-workspace.yaml`, they are instructed to use pnpm
+rather than npm or Yarn.
 
 The injected agent guidance is maintained in
 [`instructions/agent.md`](instructions/agent.md). Edit that template to change

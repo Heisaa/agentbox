@@ -41,10 +41,12 @@ const SCROLLBACK_ROWS_PER_TICK: usize = 3;
 const FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const CODEX_STATUS_SUBMIT_DELAY: Duration = Duration::from_millis(100);
 const STATUS_DISMISS_DELAY: Duration = Duration::from_millis(100);
-const STATUS_CAPTURE_DELAY: Duration = Duration::from_secs(2);
+const STATUS_CAPTURE_DELAY: Duration = Duration::from_secs(4);
 const STATUS_INITIAL_DELAY: Duration = Duration::from_secs(5);
-const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(120);
+const STATUS_RATE_LIMIT_PAUSE: Duration = Duration::from_secs(15 * 60);
 const STATUS_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_REFRESH_REQUEST_DELAY: Duration = Duration::from_secs(10);
 const STATUS_RETRY_DELAY: Duration = Duration::from_secs(2);
 const RECENT_REPO_LIMIT: usize = 8;
 const DISCOVERED_REPO_LIMIT: usize = 200;
@@ -126,6 +128,7 @@ struct Session {
     selection: Option<Selection>,
     activity: AgentActivity,
     prompt_was_hidden: bool,
+    ctrl_c_armed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,14 +193,17 @@ enum StatusPhase {
     Dismissing(Instant),
     SubmitPending(Instant),
     Capturing(Instant),
+    RefreshRequestPending(Instant),
     RetryPending(Instant),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum StatusRead {
     Success(UsageStatus),
-    Retry,
-    Failed,
+    RateLimited,
+    RefreshRequested(&'static str),
+    Retry(&'static str),
+    Failed(&'static str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -362,7 +368,7 @@ impl StatusMonitor {
     }
 
     fn request_refresh(&mut self) {
-        if matches!(self.phase, StatusPhase::Idle) {
+        if matches!(self.phase, StatusPhase::Idle) && Instant::now() >= self.next_refresh {
             self.next_refresh = Instant::now();
         }
     }
@@ -404,11 +410,18 @@ impl StatusMonitor {
                 .and_then(|terminal| terminal.exited)
                 .unwrap_or(1);
             let contents = self.contents();
-            self.summary = format!("usage checker exited with code {code}");
-            self.detail = status_detail(&contents);
+            let rate_limited = has_rate_limit_error(&contents);
+            if rate_limited {
+                self.pause_after_rate_limit(&contents, now);
+            } else {
+                self.summary = format!("usage checker exited with code {code}");
+                self.detail = status_detail(&contents);
+            }
             self.terminal = None;
             self.phase = StatusPhase::Idle;
-            self.next_refresh = now + STATUS_POLL_INTERVAL;
+            if !rate_limited {
+                self.next_refresh = now + STATUS_POLL_INTERVAL;
+            }
             return true;
         }
 
@@ -432,14 +445,18 @@ impl StatusMonitor {
             }
             StatusPhase::WaitingForReady(started) if started.elapsed() >= STATUS_READY_TIMEOUT => {
                 let contents = self.contents();
-                self.summary = "usage checker did not reach an input prompt".into();
-                self.detail = status_detail(&contents);
+                if has_rate_limit_error(&contents) {
+                    self.pause_after_rate_limit(&contents, now);
+                } else {
+                    self.summary = "usage checker did not reach an input prompt".into();
+                    self.detail = status_detail(&contents);
+                    self.phase = StatusPhase::Idle;
+                    self.next_refresh = now + STATUS_POLL_INTERVAL;
+                }
                 if let Some(terminal) = &mut self.terminal {
                     let _ = terminal.terminate();
                 }
                 self.terminal = None;
-                self.phase = StatusPhase::Idle;
-                self.next_refresh = now + STATUS_POLL_INTERVAL;
                 true
             }
             StatusPhase::Dismissing(started) if started.elapsed() >= STATUS_DISMISS_DELAY => {
@@ -463,25 +480,44 @@ impl StatusMonitor {
                         self.detail = status_detail(&contents);
                         self.phase = StatusPhase::Idle;
                     }
-                    StatusRead::Retry => {
+                    StatusRead::Retry(reason) => {
+                        self.detail = status_debug_detail(reason, &contents);
                         self.retry_attempted = true;
                         self.phase = StatusPhase::RetryPending(now);
                     }
-                    StatusRead::Failed => {
+                    StatusRead::RateLimited => {
+                        self.pause_after_rate_limit(&contents, now);
+                    }
+                    StatusRead::RefreshRequested(reason) => {
+                        self.detail = status_debug_detail(reason, &contents);
+                        self.retry_attempted = true;
+                        self.phase = StatusPhase::RefreshRequestPending(now);
+                    }
+                    StatusRead::Failed(reason) => {
                         let command = self
                             .agent
                             .command()
                             .expect("known agent has a status command");
-                        self.summary = format!("could not read {command} response");
-                        self.detail = status_detail(&contents);
+                        self.summary = format!("could not read {command} response: {reason}");
+                        self.detail = status_debug_detail(reason, &contents);
                         self.phase = StatusPhase::Idle;
                     }
                 }
                 true
             }
             StatusPhase::RetryPending(started) if started.elapsed() >= STATUS_RETRY_DELAY => {
-                self.write(b"\x1b");
-                self.phase = StatusPhase::Dismissing(now);
+                self.phase = StatusPhase::Capturing(now);
+                true
+            }
+            StatusPhase::RefreshRequestPending(started)
+                if started.elapsed() >= STATUS_REFRESH_REQUEST_DELAY =>
+            {
+                if self.has_capture {
+                    self.write(b"\x1b");
+                    self.phase = StatusPhase::Dismissing(now);
+                } else {
+                    self.submit(now);
+                }
                 true
             }
             _ => false,
@@ -501,6 +537,13 @@ impl StatusMonitor {
             self.write(format!("{command}\r").as_bytes());
             self.phase = StatusPhase::Capturing(now);
         }
+    }
+
+    fn pause_after_rate_limit(&mut self, contents: &str, now: Instant) {
+        self.summary = "usage/status paused after rate limit".into();
+        self.detail = status_detail(contents);
+        self.phase = StatusPhase::Idle;
+        self.next_refresh = now + STATUS_RATE_LIMIT_PAUSE;
     }
 
     fn write(&mut self, bytes: &[u8]) {
@@ -628,6 +671,7 @@ impl Session {
             selection: None,
             activity: AgentActivity::Starting,
             prompt_was_hidden: false,
+            ctrl_c_armed: false,
         })
     }
 
@@ -1059,6 +1103,7 @@ pub fn run() -> Result<u8> {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     if matches!(&app.overlay, Overlay::None) && matches!(key.code, KeyCode::F(3)) {
+                        disarm_ctrl_c(app.active_mut());
                         if let Err(error) = app.open_lazygit() {
                             app.overlay = Overlay::Message {
                                 title: "Lazygit".into(),
@@ -1079,6 +1124,7 @@ pub fn run() -> Result<u8> {
                     } else if let Overlay::Lazygit(lazygit) = &mut app.overlay {
                         lazygit.write(text.as_bytes());
                     } else if let Some(session) = app.active_mut() {
+                        session.ctrl_c_armed = false;
                         session.write_input(text.as_bytes());
                     }
                 }
@@ -1204,6 +1250,20 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     }
 
     {
+        if is_ctrl_c_key(key) {
+            let action = app.active_mut().map(|session| {
+                let action = ctrl_c_action(&mut session.ctrl_c_armed);
+                if action == CtrlCAction::Forward {
+                    session.write_input(&[3]);
+                }
+                action
+            });
+            if action == Some(CtrlCAction::Close) {
+                close_active_session(app);
+            }
+            return Ok(false);
+        }
+        disarm_ctrl_c(app.active_mut());
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('n')) {
             app.open_repo_picker();
             return Ok(false);
@@ -1213,15 +1273,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             return Ok(false);
         }
         if is_close_session_key(key) {
-            if let Err(error) = app.close_active_session() {
-                app.overlay = Overlay::Message {
-                    title: "Close session".into(),
-                    body: format!("{error:#}"),
-                };
-            } else if app.sessions.is_empty() {
-                app.open_repo_picker();
-            }
-            app.request_redraw();
+            close_active_session(app);
             return Ok(false);
         }
         if is_paste_image_key(key) {
@@ -1279,9 +1331,45 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
+fn close_active_session(app: &mut App) {
+    if let Err(error) = app.close_active_session() {
+        app.overlay = Overlay::Message {
+            title: "Close session".into(),
+            body: format!("{error:#}"),
+        };
+    } else if app.sessions.is_empty() {
+        app.open_repo_picker();
+    }
+    app.request_redraw();
+}
+
+fn is_ctrl_c_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c'))
+}
+
 fn is_close_session_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('w'))
+    key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w'))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtrlCAction {
+    Forward,
+    Close,
+}
+
+fn ctrl_c_action(armed: &mut bool) -> CtrlCAction {
+    if *armed {
+        CtrlCAction::Close
+    } else {
+        *armed = true;
+        CtrlCAction::Forward
+    }
+}
+
+fn disarm_ctrl_c(session: Option<&mut Session>) {
+    if let Some(session) = session {
+        session.ctrl_c_armed = false;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1693,7 +1781,7 @@ fn draw_footer(stdout: &mut Stdout, app: &App, sidebar: u16) -> Result<()> {
         MoveTo(sidebar + 2, y + 1),
         SetForegroundColor(Color::DarkGrey),
         Print(truncate(
-            "Drag copy  Wheel/PgUp scroll  F1 help  F2 details  F3 lazygit  F5 usage  Ctrl-J/K sessions  Ctrl-N new  Ctrl-C close  Ctrl-Q quit",
+            "Drag copy  Wheel/PgUp scroll  F1 help  F2 details  F3 lazygit  F5 usage  Ctrl-J/K sessions  Ctrl-N new  Ctrl-C agent/close  Ctrl-Q quit",
             app.width.saturating_sub(sidebar + 3) as usize
         )),
         ResetColor
@@ -1884,13 +1972,13 @@ fn draw_help(stdout: &mut Stdout, app: &App) -> Result<()> {
         "F4      paste a clipboard screenshot into the prompt",
         "Ctrl-V  also paste a screenshot when the terminal passes it through",
         "Ctrl-N  open a session in another repository",
-        "Ctrl-C  close the active session and remove its container",
-        "Ctrl-W  also close the active session",
+        "Ctrl-C  send to agent; press again to close the session",
+        "Ctrl-W  immediately close the active session",
         "Ctrl-J  select the next session",
         "Ctrl-K  select the previous session",
         "F6      switch to the next session",
         "F3      open host lazygit in the active repository",
-        "F5      refresh usage/status now",
+        "F5      request usage/status refresh",
         "F2      show the last captured usage/status view",
         "Ctrl-Q  quit; saved sessions resume next launch",
         "",
@@ -2189,17 +2277,20 @@ fn agent_picker(repo: PathBuf, config: &Config) -> AgentPicker {
 }
 
 fn parse_usage(contents: &str) -> Option<UsageStatus> {
+    if let Some(status) = parse_codex_five_hour_usage(contents) {
+        return Some(status);
+    }
+
     let lines = contents
         .lines()
         .map(|line| line.trim().trim_matches('│').trim())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
 
-    if let Some(line) = lines
-        .iter()
-        .find(|line| is_five_hour_label(line) && usage_percent_left(line).is_some())
+    if let Some(index) = lines.iter().position(|line| is_five_hour_label(line))
+        && let Some(status) = parse_five_hour_usage(&lines[index..])
     {
-        return format_usage_status(usage_percent_left(line)?, reset_time(line));
+        return Some(status);
     }
 
     if let Some(index) = lines
@@ -2216,7 +2307,112 @@ fn parse_usage(contents: &str) -> Option<UsageStatus> {
         return format_usage_status(percent, reset);
     }
 
+    if let Some(status) = parse_reset_usage_fallback(&lines) {
+        return Some(status);
+    }
+
+    if let Some(status) = parse_reset_usage_text_fallback(contents) {
+        return Some(status);
+    }
+
     None
+}
+
+fn parse_codex_five_hour_usage(contents: &str) -> Option<UsageStatus> {
+    let normalized = normalize_status_text(contents);
+    let lowercase = normalized.to_ascii_lowercase();
+    let start = [
+        "5h limit",
+        "5 hour limit",
+        "5-hour limit",
+        "five hour limit",
+    ]
+    .iter()
+    .filter_map(|label| lowercase.find(label))
+    .min()?;
+    let end = [
+        lowercase[start..]
+            .find("weekly limit")
+            .map(|index| start + index),
+        lowercase[start..]
+            .find("current week")
+            .map(|index| start + index),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(normalized.len());
+    let block = &normalized[start..end];
+    let percent = usage_percent_left(block)?;
+    format_usage_status(percent, reset_time(block))
+}
+
+fn parse_five_hour_usage(lines: &[&str]) -> Option<UsageStatus> {
+    let mut block = String::new();
+    for (index, line) in lines.iter().take(4).enumerate() {
+        if index > 0 && is_weekly_limit_label(line) {
+            break;
+        }
+        if !block.is_empty() {
+            block.push(' ');
+        }
+        block.push_str(line);
+    }
+    let percent = usage_percent_left(&block)?;
+    format_usage_status(percent, reset_time(&block))
+}
+
+fn parse_reset_usage_fallback(lines: &[&str]) -> Option<UsageStatus> {
+    lines
+        .iter()
+        .copied()
+        .filter(|line| {
+            let lowercase = line.to_ascii_lowercase();
+            !is_weekly_limit_label(line)
+                && !lowercase.contains("context window")
+                && lowercase.contains("reset")
+        })
+        .find_map(|line| format_usage_status(usage_percent_left(line)?, reset_time(line)))
+}
+
+fn parse_reset_usage_text_fallback(contents: &str) -> Option<UsageStatus> {
+    let normalized = normalize_status_text(contents);
+    let lowercase = normalized.to_ascii_lowercase();
+    if !lowercase.contains("reset") || !lowercase.contains("%") {
+        return None;
+    }
+
+    let weekly = lowercase.find("weekly limit").unwrap_or(lowercase.len());
+    let context = lowercase.find("context window").unwrap_or(0);
+    let search_start = if context < weekly { context } else { 0 };
+    let block = &normalized[search_start..weekly];
+    format_usage_status(usage_percent_left_before_reset(block)?, reset_time(block))
+}
+
+fn usage_percent_left_before_reset(text: &str) -> Option<u8> {
+    let lowercase = text.to_ascii_lowercase();
+    let reset = lowercase.find("reset")?;
+    let percent = text[..reset].rfind('%')?;
+    let start = text[..percent]
+        .rfind(|character: char| !character.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    let value = text[start..percent].parse::<u8>().ok()?;
+    if lowercase[percent..reset].contains("left") {
+        Some(value)
+    } else if lowercase[percent..reset].contains("used") {
+        Some(100_u8.saturating_sub(value))
+    } else {
+        None
+    }
+}
+
+fn normalize_status_text(contents: &str) -> String {
+    contents
+        .lines()
+        .map(|line| line.trim().trim_matches('│').trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -2227,9 +2423,84 @@ fn parse_usage_summary(contents: &str) -> Option<String> {
 fn read_status(contents: &str, retry_attempted: bool) -> StatusRead {
     match parse_usage(contents) {
         Some(status) => StatusRead::Success(status),
-        None if retry_attempted => StatusRead::Failed,
-        None => StatusRead::Retry,
+        None if is_rate_limited(contents) => StatusRead::RateLimited,
+        None if is_status_refresh_requested(contents) && !retry_attempted => {
+            StatusRead::RefreshRequested("Codex requested a delayed /status refresh")
+        }
+        None if is_status_refresh_requested(contents) => {
+            StatusRead::Failed("Codex still reports refresh requested after delayed /status retry")
+        }
+        None if retry_attempted => StatusRead::Failed(status_parse_failure_reason(contents)),
+        None => StatusRead::Retry(status_parse_failure_reason(contents)),
     }
+}
+
+fn status_parse_failure_reason(contents: &str) -> &'static str {
+    let normalized = normalize_status_text(contents);
+    if normalized.is_empty() {
+        return "captured screen is empty";
+    }
+
+    let lowercase = normalized.to_ascii_lowercase();
+    if lowercase.contains("openai codex")
+        && lowercase.contains('›')
+        && !lowercase.contains("/status")
+    {
+        return "captured Codex prompt before /status output appeared";
+    }
+    if !has_usage_section(&lowercase) {
+        return "captured screen has no 5h limit or current session section";
+    }
+    if !lowercase.contains('%') {
+        return "found usage section but no percentage";
+    }
+    if !lowercase.contains("left") && !lowercase.contains("used") {
+        return "found usage percentage but no left/used marker";
+    }
+    "usage/status format was not recognized"
+}
+
+fn is_status_refresh_requested(contents: &str) -> bool {
+    let lowercase = normalize_status_text(contents).to_ascii_lowercase();
+    lowercase.contains("refresh requested")
+        || lowercase.contains("run /status again shortly")
+        || lowercase.contains("try /status again shortly")
+}
+
+fn has_usage_section(lowercase: &str) -> bool {
+    [
+        "5h limit",
+        "5 hour limit",
+        "5-hour limit",
+        "five hour limit",
+        "current session",
+    ]
+    .iter()
+    .any(|label| lowercase.contains(label))
+}
+
+fn has_rate_limit_error(contents: &str) -> bool {
+    parse_usage(contents).is_none() && is_rate_limited(contents)
+}
+
+fn is_rate_limited(contents: &str) -> bool {
+    let lowercase = contents.to_ascii_lowercase();
+    [
+        "rate limited",
+        "rate-limited",
+        "rate limit reached",
+        "rate-limit reached",
+        "rate limit exceeded",
+        "rate-limit exceeded",
+        "rate_limit_exceeded",
+        "too many requests",
+        "error 429",
+        "status 429",
+        "http 429",
+        "429 too many",
+    ]
+    .iter()
+    .any(|indicator| lowercase.contains(indicator))
 }
 
 fn is_five_hour_label(line: &str) -> bool {
@@ -2242,6 +2513,11 @@ fn is_five_hour_label(line: &str) -> bool {
     ]
     .iter()
     .any(|label| lowercase.contains(label))
+}
+
+fn is_weekly_limit_label(line: &str) -> bool {
+    let lowercase = line.to_ascii_lowercase();
+    lowercase.contains("weekly limit") || lowercase.starts_with("current week")
 }
 
 fn usage_percent_left(line: &str) -> Option<u8> {
@@ -2352,6 +2628,20 @@ fn status_detail(contents: &str) -> String {
         .rev()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn status_debug_detail(reason: &str, contents: &str) -> String {
+    let normalized = normalize_status_text(contents);
+    let normalized = if normalized.is_empty() {
+        "<empty>".to_owned()
+    } else {
+        truncate(&normalized, 240)
+    };
+    format!(
+        "diagnostic: {reason}\ncaptured bytes: {}\nnormalized: {normalized}\n\ncaptured screen:\n{}",
+        contents.len(),
+        status_detail(contents)
+    )
 }
 
 fn paste_clipboard_image(session: &mut Session) -> Result<PathBuf> {
@@ -3128,10 +3418,157 @@ mod tests {
         let codex = "5h limit:\nWeekly limit: 84% left";
         let claude = "Current session\nCurrent week (all models)\n55% used";
 
-        assert_eq!(read_status(codex, false), StatusRead::Retry);
-        assert_eq!(read_status(codex, true), StatusRead::Failed);
-        assert_eq!(read_status(claude, false), StatusRead::Retry);
-        assert_eq!(read_status(claude, true), StatusRead::Failed);
+        assert_eq!(
+            read_status(codex, false),
+            StatusRead::Retry("found usage section but no percentage")
+        );
+        assert_eq!(
+            read_status(codex, true),
+            StatusRead::Failed("found usage section but no percentage")
+        );
+        assert_eq!(
+            read_status(claude, false),
+            StatusRead::Retry("usage/status format was not recognized")
+        );
+        assert_eq!(
+            read_status(claude, true),
+            StatusRead::Failed("usage/status format was not recognized")
+        );
+    }
+
+    #[test]
+    fn wrapped_codex_five_hour_status_is_parsed() {
+        let status = "\
+5h limit:
+[███████████████████░] 94% left (resets 18:49)
+Weekly limit: [█████████░░░░░░░░░░░] 43% left";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("94% left, resets 18:49".into())
+        );
+    }
+
+    #[test]
+    fn rate_limited_status_pauses_refreshes() {
+        assert_eq!(
+            read_status("Error 429: too many requests", false),
+            StatusRead::RateLimited
+        );
+        assert_eq!(
+            read_status("rate limit reached", false),
+            StatusRead::RateLimited
+        );
+    }
+
+    #[test]
+    fn codex_refresh_requested_gets_one_delayed_status_retry() {
+        let status = "Limits: refresh requested; run /status again shortly.";
+
+        assert_eq!(
+            read_status(status, false),
+            StatusRead::RefreshRequested("Codex requested a delayed /status refresh")
+        );
+        assert_eq!(
+            read_status(status, true),
+            StatusRead::Failed("Codex still reports refresh requested after delayed /status retry")
+        );
+    }
+
+    #[test]
+    fn codex_rate_limits_label_does_not_pause_refreshes() {
+        assert_eq!(
+            read_status("Rate limits\n5h limit: 50% left", false),
+            StatusRead::Success(UsageStatus {
+                percent_left: 50,
+                summary: "50% left".into()
+            })
+        );
+    }
+
+    #[test]
+    fn codex_status_usage_link_text_does_not_pause_refreshes() {
+        let status = "\
+Visit https://chatgpt.com/codex/settings/usage for up-to-date
+information on rate limits and credits
+Model: gpt-5.5 (reasoning high, summaries auto)
+Context window: 83% left (52.8K used / 258K)
+5h limit:             [███████████████████░] 94% left (resets 18:49)
+Weekly limit:         [█████████░░░░░░░░░░░] 43% left (resets 10:50 on 18 Jun)";
+
+        assert_eq!(
+            read_status(status, false),
+            StatusRead::Success(UsageStatus {
+                percent_left: 94,
+                summary: "94% left, resets 18:49".into()
+            })
+        );
+    }
+
+    #[test]
+    fn bordered_codex_status_screen_is_parsed() {
+        let status = "\
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                   │
+│ information on rate limits and credits                                          │
+│ Model:                gpt-5.5 (reasoning high, summaries auto)                 │
+│ Context window:       83% left (52.8K used / 258K)                             │
+│ 5h limit:             [███████████████████░] 94% left (resets 18:49)           │
+│ Weekly limit:         [█████████░░░░░░░░░░░] 43% left (resets 10:50 on 18 Jun) │";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("94% left, resets 18:49".into())
+        );
+    }
+
+    #[test]
+    fn pasted_codex_status_screen_is_parsed() {
+        let status = "\
+│  >_ OpenAI Codex (v0.140.0)                                                     │
+│                                                                                 │
+│ Visit https://chatgpt.com/codex/settings/usage for up-to-date                   │
+│ information on rate limits and credits                                          │
+│                                                                                 │
+│  Model:                gpt-5.5 (reasoning high, summaries auto)                 │
+│  Directory:            /workspace                                               │
+│  Permissions:          Full Access                                              │
+│  Agents.md:            <none>                                                   │
+│  Account:              user@example.com (Plus)                                  │
+│  Collaboration mode:   Default                                                  │
+│  Session:              019ed042-3997-7e11-8a66-f58adb42a0df                     │
+│                                                                                 │
+│  Context window:       74% left (75K used / 258K)                               │
+│  5h limit:             [██████████████████░░] 88% left (resets 18:49)           │
+│  Weekly limit:         [████████░░░░░░░░░░░░] 42% left (resets 10:50 on 18 Jun) │";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("88% left, resets 18:49".into())
+        );
+    }
+
+    #[test]
+    fn reset_usage_row_is_parsed_when_five_hour_label_is_missing() {
+        let status = "\
+Context window:       74% left (75K used / 258K)
+[██████████████████░░] 88% left (resets 18:49)
+Weekly limit:         [████████░░░░░░░░░░░░] 42% left (resets 10:50 on 18 Jun)";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("88% left, resets 18:49".into())
+        );
+    }
+
+    #[test]
+    fn normalized_reset_usage_fallback_ignores_context_window_percent() {
+        let status = "\
+Context window: 74% left (75K used / 258K) [██████████████████░░] 88% left (resets 18:49) Weekly limit: 42% left";
+
+        assert_eq!(
+            parse_usage_summary(status),
+            Some("88% left, resets 18:49".into())
+        );
     }
 
     #[test]
@@ -3188,6 +3625,18 @@ Current week (all models)\n\
     }
 
     #[test]
+    fn manual_status_refresh_respects_next_refresh() {
+        let mut monitor =
+            StatusMonitor::new(AgentKind::Codex, "container".into(), "/workspace".into());
+        monitor.next_refresh = Instant::now() + STATUS_RATE_LIMIT_PAUSE;
+        let paused_until = monitor.next_refresh;
+
+        monitor.request_refresh();
+
+        assert_eq!(monitor.next_refresh, paused_until);
+    }
+
+    #[test]
     fn usage_footer_adds_a_bar_for_the_percent_left() {
         assert_eq!(
             usage_footer("50% left, resets 19:30", Some(50), 80),
@@ -3241,8 +3690,19 @@ Current week (all models)\n\
     }
 
     #[test]
-    fn ctrl_c_and_ctrl_w_close_tui_sessions() {
-        assert!(is_close_session_key(KeyEvent::new(
+    fn first_ctrl_c_is_forwarded_and_second_closes_the_session() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(is_ctrl_c_key(ctrl_c));
+
+        let mut armed = false;
+        assert_eq!(ctrl_c_action(&mut armed), CtrlCAction::Forward);
+        assert!(armed);
+        assert_eq!(ctrl_c_action(&mut armed), CtrlCAction::Close);
+    }
+
+    #[test]
+    fn ctrl_w_is_the_immediate_close_shortcut() {
+        assert!(!is_close_session_key(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL
         )));
@@ -3613,7 +4073,9 @@ Current week (all models)\n\
         assert_eq!(AgentKind::Claude.command(), Some("/usage"));
         assert_eq!(AgentKind::Codex.command(), Some("/status"));
         assert_eq!(STATUS_INITIAL_DELAY, Duration::from_secs(5));
-        assert_eq!(STATUS_POLL_INTERVAL, Duration::from_secs(30));
+        assert_eq!(STATUS_POLL_INTERVAL, Duration::from_secs(120));
+        assert_eq!(STATUS_RATE_LIMIT_PAUSE, Duration::from_secs(15 * 60));
+        assert_eq!(STATUS_REFRESH_REQUEST_DELAY, Duration::from_secs(10));
         assert_eq!(STATUS_RETRY_DELAY, Duration::from_secs(2));
     }
 

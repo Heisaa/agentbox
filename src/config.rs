@@ -163,6 +163,7 @@ pub struct CacheConfig {
 pub struct LimitsConfig {
     pub cpus: f32,
     pub memory: String,
+    pub pids: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +271,7 @@ impl Default for LimitsConfig {
         Self {
             cpus: 4.0,
             memory: "8g".into(),
+            pids: 2048,
         }
     }
 }
