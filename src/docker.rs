@@ -23,7 +23,7 @@ pub struct RunSpec {
     pub environment: BTreeMap<String, String>,
     pub workspace_write: bool,
     pub uid_gid: String,
-    pub imported_credentials: Option<&'static str>,
+    pub imported_credentials: Option<String>,
     runtime_image: String,
     cargo_cache: bool,
     credential_file: Option<NamedTempFile>,
@@ -52,6 +52,17 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     let config = input.config;
     let slug = crate::project::project_slug(input.repo_root);
     let uid_gid = host_uid_gid()?;
+    let mut command = input.command.clone();
+    let codex_account = command
+        .first()
+        .map(String::as_str)
+        .map(codex_account_from_command_name)
+        .transpose()?
+        .flatten()
+        .map(str::to_owned);
+    if codex_account.is_some() {
+        command[0] = "codex".into();
+    }
     let mut args = vec![OsString::from("run"), OsString::from("--rm")];
 
     if input.interactive {
@@ -162,9 +173,13 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         add_volume(&mut args, "agentbox-pip-cache", "/home/agent/.cache/pip");
     }
 
-    let (imported_credentials, credential_file) =
-        add_agent_credentials(&mut args, input.host_home, &input.command)?;
-    let claude_state_file = if imported_credentials == Some("claude") {
+    let (imported_credentials, credential_file) = add_agent_credentials(
+        &mut args,
+        input.host_home,
+        &command,
+        codex_account.as_deref(),
+    )?;
+    let claude_state_file = if imported_credentials.as_deref() == Some("claude") {
         add_claude_state(&mut args, input.host_home)?
     } else {
         None
@@ -187,7 +202,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         "AGENTBOX_AUTO_UPDATE={}",
         u8::from(config.runtime.auto_update)
     )));
-    if let Some(agent) = update_agent(&input.command) {
+    if let Some(agent) = update_agent(&command) {
         args.push(OsString::from("--env"));
         args.push(OsString::from(format!("AGENTBOX_UPDATE_AGENT={agent}")));
     }
@@ -202,7 +217,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     // interpreted by `docker run` as an additional flag (e.g. `--privileged`).
     args.push(OsString::from("--"));
     args.push(OsString::from(&runtime_image));
-    args.extend(input.command.iter().map(OsString::from));
+    args.extend(command.iter().map(OsString::from));
 
     Ok(RunSpec {
         args,
@@ -374,11 +389,35 @@ fn update_agent(command: &[String]) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn codex_account_from_command_name(command_name: &str) -> Result<Option<&str>> {
+    let Some(account) = command_name.strip_prefix("codex@") else {
+        return Ok(None);
+    };
+    validate_codex_account_name(account)?;
+    Ok(Some(account))
+}
+
+fn validate_codex_account_name(account: &str) -> Result<()> {
+    if account.is_empty() {
+        anyhow::bail!("Codex account name cannot be empty");
+    }
+    if !account
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!(
+            "Codex account name `{account}` is invalid; use only letters, numbers, '.', '_', and '-'"
+        );
+    }
+    Ok(())
+}
+
 fn add_agent_credentials(
     args: &mut Vec<OsString>,
     host_home: Option<&Path>,
     command: &[String],
-) -> Result<(Option<&'static str>, Option<NamedTempFile>)> {
+    codex_account: Option<&str>,
+) -> Result<(Option<String>, Option<NamedTempFile>)> {
     let Some(home) = host_home else {
         return Ok((None, None));
     };
@@ -388,11 +427,12 @@ fn add_agent_credentials(
             home.join(".claude/.credentials.json"),
             "/tmp/agentbox-claude-credentials.json",
         ),
-        Some("codex") => (
-            "codex",
-            home.join(".codex/auth.json"),
-            "/tmp/agentbox-codex-auth.json",
-        ),
+        Some("codex") => {
+            let source = codex_account
+                .map(|account| home.join(".codex/accounts").join(account).join("auth.json"))
+                .unwrap_or_else(|| home.join(".codex/auth.json"));
+            ("codex", source, "/tmp/agentbox-codex-auth.json")
+        }
         _ => return Ok((None, None)),
     };
 
@@ -406,6 +446,12 @@ fn add_agent_credentials(
         let path = exported.path().to_path_buf();
         temporary = Some(exported);
         path
+    } else if let ("codex", Some(account)) = (agent, codex_account) {
+        anyhow::bail!(
+            "Codex account `{}` was not found at {}; create it by saving an auth.json there",
+            account,
+            file_source.display()
+        );
     } else {
         return Ok((None, None));
     };
@@ -415,7 +461,14 @@ fn add_agent_credentials(
     args.push(OsString::from(format!(
         "AGENTBOX_IMPORT_CREDENTIALS={agent}"
     )));
-    Ok((Some(agent), temporary))
+    if let Some(account) = codex_account {
+        args.push(OsString::from("--env"));
+        args.push(OsString::from(format!("AGENTBOX_CODEX_ACCOUNT={account}")));
+    }
+    let imported = codex_account
+        .map(|account| format!("codex@{account}"))
+        .unwrap_or_else(|| agent.to_owned());
+    Ok((Some(imported), temporary))
 }
 
 fn add_claude_state(
@@ -837,7 +890,7 @@ mod tests {
             assert!(rendered.contains(expected));
             assert!(!rendered.contains(unexpected));
             assert!(rendered.contains("readonly"));
-            assert_eq!(spec.imported_credentials, Some(command));
+            assert_eq!(spec.imported_credentials.as_deref(), Some(command));
             assert!(spec.credential_file.is_none());
             if command == "claude" {
                 assert!(rendered.contains("/tmp/agentbox-claude-state.json"));
@@ -848,6 +901,59 @@ mod tests {
                 assert!(spec.claude_state_file.is_none());
             }
         }
+    }
+
+    #[test]
+    fn named_codex_account_imports_selected_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex/accounts/work")).unwrap();
+        std::fs::write(home.join(".codex/accounts/work/auth.json"), "{}").unwrap();
+
+        let spec = build_run_spec(BuildInput {
+            config: &Config::default(),
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["codex@work".into(), "--no-alt-screen".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(".codex/accounts/work/auth.json"));
+        assert!(rendered.contains("AGENTBOX_IMPORT_CREDENTIALS=codex"));
+        assert!(rendered.contains("AGENTBOX_CODEX_ACCOUNT=work"));
+        assert!(rendered.ends_with("codex --no-alt-screen"));
+        assert!(!rendered.contains("codex@work"));
+        assert_eq!(spec.imported_credentials.as_deref(), Some("codex@work"));
+    }
+
+    #[test]
+    fn missing_named_codex_account_is_an_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+
+        let error = build_run_spec(BuildInput {
+            config: &Config::default(),
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["codex@work".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Codex account `work` was not found"));
+        assert!(error.contains(".codex/accounts/work/auth.json"));
     }
 
     #[test]

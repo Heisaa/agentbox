@@ -194,6 +194,21 @@ container. For Claude, Agentbox also imports only the theme from
 servers, project history, and other settings are excluded. Shells, custom
 agents, and the other built-in agent receive no credential.
 
+Codex can also use named host accounts. Save each extra account at
+`~/.codex/accounts/<name>/auth.json`, then select it by appending the name to
+the Codex agent:
+
+```sh
+agentbox run codex@work
+agentbox run codex@personal -- --no-alt-screen
+```
+
+Plain `agentbox run codex` still uses `~/.codex/auth.json`. Named account
+aliases may contain only letters, numbers, `.`, `_`, and `-`; selecting a named
+account that does not exist fails fast instead of silently launching unauthenticated.
+Each session gets its own container-local credential copy, so multiple Codex
+accounts can be active in separate Agentbox sessions at the same time.
+
 `agentbox init` creates `.agentbox/config.toml`, an ignored local development
 environment file location, and an example env file. Edit `runtime.image` to use
 a custom image directly, or configure `runtime.dockerfile` to derive a

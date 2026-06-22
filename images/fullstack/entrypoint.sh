@@ -39,8 +39,12 @@ import_agent_credentials() {
     chmod 600 "$session_credential"
     rm -f "$destination"
     ln -s "$session_credential" "$destination"
+    credential_label="$AGENTBOX_IMPORT_CREDENTIALS"
+    if [ "$AGENTBOX_IMPORT_CREDENTIALS" = "codex" ] && [ -n "${AGENTBOX_CODEX_ACCOUNT:-}" ]; then
+        credential_label="codex@$AGENTBOX_CODEX_ACCOUNT"
+    fi
     printf '%s\n' "Agent credentials:"
-    printf '%s\n' "- Imported $AGENTBOX_IMPORT_CREDENTIALS credentials from host"
+    printf '%s\n' "- Imported $credential_label credentials from host"
 }
 
 import_claude_state() {

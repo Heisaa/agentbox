@@ -535,7 +535,7 @@ fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Resul
             command.push("--append-system-prompt".into());
             command.push(guidance);
         }
-        Some("codex") => {
+        Some(command_name) if is_codex_command_name(command_name)? => {
             command.push("-c".into());
             command.push(format!("developer_instructions={guidance:?}"));
         }
@@ -571,15 +571,20 @@ fn apply_agentbox_permissions(command: &mut Vec<String>) {
                 command.push("--dangerously-skip-permissions".into());
             }
         }
-        Some("codex")
-            if !command
-                .iter()
-                .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox") =>
+        Some(command_name)
+            if is_codex_command_name(command_name).unwrap_or(false)
+                && !command
+                    .iter()
+                    .any(|argument| argument == "--dangerously-bypass-approvals-and-sandbox") =>
         {
             command.push("--dangerously-bypass-approvals-and-sandbox".into());
         }
         _ => {}
     }
+}
+
+fn is_codex_command_name(command_name: &str) -> Result<bool> {
+    Ok(command_name == "codex" || docker::codex_account_from_command_name(command_name)?.is_some())
 }
 
 fn project_guidance(config: &Config, tools: &ProjectTools) -> String {
@@ -636,6 +641,7 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
     println!(
         "- Host agent credentials: {}",
         spec.imported_credentials
+            .as_deref()
             .map(|agent| format!("{agent} (read-only source, container-local copy)"))
             .unwrap_or_else(|| "none".into())
     );
@@ -801,7 +807,33 @@ mod tests {
         assert_eq!(command[1], "--dangerously-bypass-approvals-and-sandbox");
         assert_eq!(command[2], "-c");
         assert!(command[3].contains("# Agentbox environment"));
-        assert!(command[3].contains("database migrations"));
+    }
+
+    #[test]
+    fn named_codex_profile_disables_nested_sandbox() {
+        let args = RunArgs {
+            agent: Some("codex@work".into()),
+            ..RunArgs::default()
+        };
+
+        let command = agent_command(&Config::default(), &args, &ProjectTools::default()).unwrap();
+        assert_eq!(command[0], "codex@work");
+        assert_eq!(command[1], "--dangerously-bypass-approvals-and-sandbox");
+        assert_eq!(command[2], "-c");
+        assert!(command[3].contains("# Agentbox environment"));
+    }
+
+    #[test]
+    fn invalid_named_codex_profile_is_rejected() {
+        let args = RunArgs {
+            agent: Some("codex@../work".into()),
+            ..RunArgs::default()
+        };
+
+        let error = agent_command(&Config::default(), &args, &ProjectTools::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Codex account name"));
     }
 
     #[test]

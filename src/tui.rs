@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     io::{self, Read, Stdout, Write},
     path::{Path, PathBuf},
@@ -17,8 +17,9 @@ use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, MoveTo, Show},
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute, queue,
     style::{
@@ -53,6 +54,9 @@ const DISCOVERED_REPO_LIMIT: usize = 200;
 const REPO_SEARCH_DEPTH: usize = 4;
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+const REMOVE_CONTAINER_VERIFY_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOVE_CONTAINER_VERIFY_INTERVAL: Duration = Duration::from_millis(100);
+const PASTE_KEY_SUPPRESSION_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentKind {
@@ -272,6 +276,19 @@ impl PtyProcess {
     fn write(&mut self, bytes: &[u8]) {
         let _ = self.writer.write_all(bytes);
         let _ = self.writer.flush();
+    }
+
+    fn paste(&mut self, text: &str, force_bracketed: bool) {
+        self.write(&encode_paste(
+            text,
+            force_bracketed || self.bracketed_paste(),
+        ));
+    }
+
+    fn bracketed_paste(&self) -> bool {
+        self.parser
+            .lock()
+            .is_ok_and(|parser| parser.screen().bracketed_paste())
     }
 
     fn poll(&mut self) -> bool {
@@ -690,6 +707,16 @@ impl Session {
         }
     }
 
+    fn paste_input(&mut self, text: &str) {
+        self.selection = None;
+        self.terminal.reset_scrollback();
+        self.terminal.paste(text, self.agent == AgentKind::Codex);
+        if text.contains('\r') || text.contains('\n') {
+            self.activity = AgentActivity::Working;
+            self.prompt_was_hidden = false;
+        }
+    }
+
     fn poll(&mut self) -> bool {
         let mut changed = self.terminal.poll();
         if self.terminal.exited.is_none() {
@@ -802,7 +829,13 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(stdout: &mut Stdout) -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            Hide
+        )?;
         Ok(Self { active: true })
     }
 }
@@ -813,6 +846,7 @@ impl Drop for TerminalGuard {
             let _ = disable_raw_mode();
             let _ = execute!(
                 io::stdout(),
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 Show,
                 LeaveAlternateScreen,
@@ -856,11 +890,17 @@ struct App {
     status_monitors: StatusMonitors,
     selected: usize,
     overlay: Overlay,
+    paste_key_suppression: Option<PasteKeySuppression>,
     sequence: usize,
     recent_repos: Vec<PathBuf>,
     width: u16,
     height: u16,
     redraw: bool,
+}
+
+struct PasteKeySuppression {
+    remaining: VecDeque<char>,
+    until: Instant,
 }
 
 impl App {
@@ -870,6 +910,7 @@ impl App {
             status_monitors: StatusMonitors::default(),
             selected: 0,
             overlay: Overlay::None,
+            paste_key_suppression: None,
             sequence: 0,
             recent_repos: load_recent_repos(),
             width,
@@ -1077,6 +1118,43 @@ impl App {
         }
         self.request_redraw();
     }
+
+    fn suppress_duplicate_paste_keys(&mut self, text: &str) {
+        let remaining = text.chars().collect::<VecDeque<_>>();
+        if remaining.is_empty() {
+            return;
+        }
+        self.paste_key_suppression = Some(PasteKeySuppression {
+            remaining,
+            until: Instant::now() + PASTE_KEY_SUPPRESSION_DURATION,
+        });
+    }
+
+    fn suppresses_duplicate_paste_key(&mut self, key: KeyEvent) -> bool {
+        let Some(input) = paste_key_character(key) else {
+            return false;
+        };
+        let Some(suppression) = &mut self.paste_key_suppression else {
+            return false;
+        };
+        if Instant::now() >= suppression.until {
+            self.paste_key_suppression = None;
+            return false;
+        }
+        let Some(expected) = suppression.remaining.front().copied() else {
+            self.paste_key_suppression = None;
+            return false;
+        };
+        if !paste_characters_match(input, expected) {
+            self.paste_key_suppression = None;
+            return false;
+        }
+        suppression.remaining.pop_front();
+        if suppression.remaining.is_empty() {
+            self.paste_key_suppression = None;
+        }
+        true
+    }
 }
 
 pub fn run() -> Result<u8> {
@@ -1102,7 +1180,11 @@ pub fn run() -> Result<u8> {
         if event::poll(FRAME_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if matches!(&app.overlay, Overlay::None) && matches!(key.code, KeyCode::F(3)) {
+                    if app.suppresses_duplicate_paste_key(key) {
+                        continue;
+                    } else if matches!(&app.overlay, Overlay::None)
+                        && matches!(key.code, KeyCode::F(3))
+                    {
                         disarm_ctrl_c(app.active_mut());
                         if let Err(error) = app.open_lazygit() {
                             app.overlay = Overlay::Message {
@@ -1122,10 +1204,14 @@ pub fn run() -> Result<u8> {
                         picker.error.clear();
                         app.request_redraw();
                     } else if let Overlay::Lazygit(lazygit) = &mut app.overlay {
-                        lazygit.write(text.as_bytes());
+                        lazygit.paste(&text, false);
                     } else if let Some(session) = app.active_mut() {
                         session.ctrl_c_armed = false;
-                        session.write_input(text.as_bytes());
+                        let suppress_duplicate_keys = session.agent == AgentKind::Codex;
+                        session.paste_input(&text);
+                        if suppress_duplicate_keys {
+                            app.suppress_duplicate_paste_keys(&text);
+                        }
                     }
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
@@ -2173,7 +2259,7 @@ fn classify_agent(command: &str, default: &str) -> AgentKind {
         .as_deref()
     {
         Some("claude") => AgentKind::Claude,
-        Some("codex") => AgentKind::Codex,
+        Some(command) if command == "codex" || command.starts_with("codex@") => AgentKind::Codex,
         _ => AgentKind::Other,
     }
 }
@@ -2451,6 +2537,14 @@ fn status_parse_failure_reason(contents: &str) -> &'static str {
     if !has_usage_section(&lowercase) {
         return "captured screen has no 5h limit or current session section";
     }
+    if let Some(block) = codex_five_hour_text_block(&lowercase) {
+        if !block.contains('%') {
+            return "found usage section but no percentage";
+        }
+        if !block.contains("left") && !block.contains("used") {
+            return "found usage percentage but no left/used marker";
+        }
+    }
     if !lowercase.contains('%') {
         return "found usage section but no percentage";
     }
@@ -2458,6 +2552,31 @@ fn status_parse_failure_reason(contents: &str) -> &'static str {
         return "found usage percentage but no left/used marker";
     }
     "usage/status format was not recognized"
+}
+
+fn codex_five_hour_text_block(normalized_lowercase: &str) -> Option<&str> {
+    let start = [
+        "5h limit",
+        "5 hour limit",
+        "5-hour limit",
+        "five hour limit",
+    ]
+    .iter()
+    .filter_map(|label| normalized_lowercase.find(label))
+    .min()?;
+    let end = [
+        normalized_lowercase[start..]
+            .find("weekly limit")
+            .map(|index| start + index),
+        normalized_lowercase[start..]
+            .find("current week")
+            .map(|index| start + index),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(normalized_lowercase.len());
+    Some(&normalized_lowercase[start..end])
 }
 
 fn is_status_refresh_requested(contents: &str) -> bool {
@@ -2859,15 +2978,62 @@ fn remove_container(container: &str) -> Result<()> {
         .args(["rm", "-f", container])
         .output()
         .context("failed to execute docker")?;
-    if !output.status.success()
-        && !String::from_utf8_lossy(&output.stderr).contains("No such container")
-    {
-        anyhow::bail!(
-            "failed to remove container {container}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    if output.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if docker_reports_missing_container(&stderr)
+        || docker_reports_container_removal_started(&stderr)
+        || wait_for_container_absence(container)?
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!("failed to remove container {container}: {}", stderr.trim());
+}
+
+fn wait_for_container_absence(container: &str) -> Result<bool> {
+    let deadline = Instant::now() + REMOVE_CONTAINER_VERIFY_TIMEOUT;
+    loop {
+        if !container_exists(container)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(REMOVE_CONTAINER_VERIFY_INTERVAL);
+    }
+}
+
+fn container_exists(container: &str) -> Result<bool> {
+    let output = process::Command::new("docker")
+        .args(["container", "inspect", "--format", "{{.Id}}", container])
+        .output()
+        .context("failed to inspect container after remove failed")?;
+    if output.status.success() {
+        return Ok(true);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if docker_reports_missing_container(&stderr) {
+        return Ok(false);
+    }
+
+    anyhow::bail!(
+        "failed to inspect container {container} after remove failed: {}",
+        stderr.trim()
+    );
+}
+
+fn docker_reports_missing_container(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no such container") || stderr.contains("no such object")
+}
+
+fn docker_reports_container_removal_started(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("removal of container") && stderr.contains("already in progress")
 }
 
 #[derive(Clone, Copy)]
@@ -3118,6 +3284,33 @@ fn reset_parser_scrollback(parser: &mut vt100::Parser) -> bool {
     current != 0
 }
 
+fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return text.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(text.len() + b"\x1b[200~\x1b[201~".len());
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+fn paste_key_character(key: KeyEvent) -> Option<char> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(character) => Some(character),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
+    }
+}
+
+fn paste_characters_match(input: char, expected: char) -> bool {
+    input == expected || (input == '\n' && expected == '\r')
+}
+
 fn encode_key(key: KeyEvent) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -3207,6 +3400,7 @@ mod tests {
     fn classifies_configured_agents() {
         assert_eq!(classify_agent("claude --flag", "codex"), AgentKind::Claude);
         assert_eq!(classify_agent("", "codex"), AgentKind::Codex);
+        assert_eq!(classify_agent("codex@work", "claude"), AgentKind::Codex);
         assert_eq!(classify_agent("wrapper claude", "claude"), AgentKind::Other);
     }
 
@@ -3690,6 +3884,53 @@ Current week (all models)\n\
     }
 
     #[test]
+    fn paste_is_bracketed_only_when_child_requests_it() {
+        assert_eq!(encode_paste("one\ntwo", false), b"one\ntwo");
+        assert_eq!(
+            encode_paste("one\ntwo", true),
+            b"\x1b[200~one\ntwo\x1b[201~"
+        );
+    }
+
+    #[test]
+    fn duplicate_paste_key_suppression_matches_the_paste_prefix() {
+        let mut app = App::new(80, 24);
+        app.suppress_duplicate_paste_keys("ab\n");
+
+        assert!(
+            app.suppresses_duplicate_paste_key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE
+            ))
+        );
+        assert!(
+            app.suppresses_duplicate_paste_key(KeyEvent::new(
+                KeyCode::Char('b'),
+                KeyModifiers::NONE
+            ))
+        );
+        assert!(
+            app.suppresses_duplicate_paste_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+        assert!(
+            !app.suppresses_duplicate_paste_key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE
+            ))
+        );
+    }
+
+    #[test]
+    fn duplicate_paste_key_suppression_does_not_swallow_submit_enter() {
+        let mut app = App::new(80, 24);
+        app.suppress_duplicate_paste_keys("hello");
+
+        assert!(
+            !app.suppresses_duplicate_paste_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        );
+    }
+
+    #[test]
     fn first_ctrl_c_is_forwarded_and_second_closes_the_session() {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(is_ctrl_c_key(ctrl_c));
@@ -3714,6 +3955,29 @@ Current week (all models)\n\
             KeyCode::Char('c'),
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn docker_missing_container_errors_are_treated_as_closed() {
+        assert!(docker_reports_missing_container(
+            "Error response from daemon: No such container: agentbox-demo"
+        ));
+        assert!(docker_reports_missing_container(
+            "Error: No such object: agentbox-demo"
+        ));
+        assert!(!docker_reports_missing_container(
+            "Error response from daemon: permission denied"
+        ));
+    }
+
+    #[test]
+    fn docker_removal_in_progress_errors_are_treated_as_closed() {
+        assert!(docker_reports_container_removal_started(
+            "Error response from daemon: removal of container agentbox-demo is already in progress"
+        ));
+        assert!(!docker_reports_container_removal_started(
+            "Error response from daemon: failed to remove root filesystem"
+        ));
     }
 
     #[test]
