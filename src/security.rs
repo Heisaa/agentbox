@@ -45,6 +45,14 @@ pub fn validate_config(config: &Config) -> Result<()> {
             "runtime.image must not start with '-'; a leading dash would be parsed by docker as a flag"
         );
     }
+    if config.gui.enabled {
+        if !config.gui.x11 && !config.gui.wayland {
+            anyhow::bail!("gui.enabled requires at least one of gui.x11 or gui.wayland");
+        }
+        if config.gui.x11_socket.as_os_str().is_empty() {
+            anyhow::bail!("gui.x11_socket must not be empty when GUI passthrough is enabled");
+        }
+    }
     if !config.runtime.dockerfile.as_os_str().is_empty()
         && config.runtime.build_context.as_os_str().is_empty()
     {
@@ -267,6 +275,21 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("network.mode = \"compose\"")
+        );
+    }
+
+    #[test]
+    fn gui_passthrough_requires_a_display_backend() {
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.x11 = false;
+        config.gui.wayland = false;
+
+        assert!(
+            validate_config(&config)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one of gui.x11 or gui.wayland")
         );
     }
 

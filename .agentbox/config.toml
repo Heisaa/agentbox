@@ -25,6 +25,17 @@ file = ".agentbox/env"
 [env.defaults]
 NODE_ENV = "development"
 
+[gui]
+display = ""
+enabled = true
+import_codex_credentials = true
+wayland = true
+wayland_display = ""
+wayland_socket = ""
+x11 = true
+x11_socket = "/tmp/.X11-unix"
+xauthority = ""
+
 [headroom]
 enabled = false
 service = "headroom"
@@ -33,6 +44,7 @@ url = "http://headroom:8787"
 [limits]
 cpus = 4.0
 memory = "8g"
+pids = 2048
 
 [network]
 compose_files = ["compose.yaml"]
@@ -42,6 +54,8 @@ mode = "compose"
 
 [runtime]
 auto_update = true
+build_context = "."
+dockerfile = ""
 image = "agentbox/fullstack:latest"
 
 [security]

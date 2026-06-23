@@ -1,8 +1,8 @@
 version = 1
 
 [agent]
-command = "claude"
-default = "claude"
+command = ""
+default = "codex"
 home = "persistent"
 
 [caches]

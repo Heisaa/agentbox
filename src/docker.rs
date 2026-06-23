@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     compose::ComposeProject,
-    config::{Config, HomeMode, NetworkMode},
+    config::{Config, GuiConfig, HomeMode, NetworkMode},
 };
 
 #[derive(Debug)]
@@ -26,6 +26,7 @@ pub struct RunSpec {
     pub imported_credentials: Option<String>,
     runtime_image: String,
     cargo_cache: bool,
+    codex_desktop_cache: bool,
     credential_file: Option<NamedTempFile>,
     claude_state_file: Option<NamedTempFile>,
 }
@@ -155,7 +156,9 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     if config.caches.npm {
         add_volume(&mut args, "agentbox-npm-cache", "/home/agent/.npm");
     }
-    if config.caches.pnpm {
+    if config.gui.enabled {
+        add_volume(&mut args, "agentbox-gui-local", "/home/agent/.local");
+    } else if config.caches.pnpm {
         add_volume(
             &mut args,
             "agentbox-pnpm-cache",
@@ -169,14 +172,24 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
             "/home/agent/.cargo/registry",
         );
     }
-    if config.caches.pip {
+    if config.gui.enabled {
+        add_volume(&mut args, "agentbox-gui-cache", "/home/agent/.cache");
+    } else if config.caches.pip {
         add_volume(&mut args, "agentbox-pip-cache", "/home/agent/.cache/pip");
     }
+    if config.gui.enabled {
+        add_volume(
+            &mut args,
+            "agentbox-codex-desktop",
+            "/agentbox/codex-desktop",
+        );
+    }
 
+    let credential_command = credential_command(config, &command);
     let (imported_credentials, credential_file) = add_agent_credentials(
         &mut args,
         input.host_home,
-        &command,
+        credential_command.as_slice(),
         codex_account.as_deref(),
     )?;
     let claude_state_file = if imported_credentials.as_deref() == Some("claude") {
@@ -211,6 +224,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         "AGENTBOX_CAVEMAN={}",
         u8::from(config.caveman.enabled)
     )));
+    add_gui(&mut args, &config.gui, input.host_home)?;
 
     let runtime_image = runtime_image(config, input.repo_root);
     // Terminate option parsing so a repo-supplied image reference cannot be
@@ -228,6 +242,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         imported_credentials,
         runtime_image,
         cargo_cache: config.caches.cargo,
+        codex_desktop_cache: config.gui.enabled,
         credential_file,
         claude_state_file,
     })
@@ -389,6 +404,20 @@ fn update_agent(command: &[String]) -> Option<&'static str> {
     }
 }
 
+fn credential_command(config: &Config, command: &[String]) -> Vec<String> {
+    if config.gui.enabled
+        && config.gui.import_codex_credentials
+        && !matches!(
+            command.first().map(String::as_str),
+            Some("claude" | "codex")
+        )
+    {
+        vec!["codex".into()]
+    } else {
+        command.to_vec()
+    }
+}
+
 pub(crate) fn codex_account_from_command_name(command_name: &str) -> Result<Option<&str>> {
     let Some(account) = command_name.strip_prefix("codex@") else {
         return Ok(None);
@@ -410,6 +439,109 @@ fn validate_codex_account_name(account: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn add_gui(args: &mut Vec<OsString>, config: &GuiConfig, host_home: Option<&Path>) -> Result<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+
+    let mut added = false;
+    if config.wayland && add_wayland(args, config)? {
+        added = true;
+    }
+    if config.x11 && add_x11(args, config, host_home)? {
+        added = true;
+    }
+    if !added {
+        anyhow::bail!("GUI passthrough is enabled, but no usable X11 or Wayland socket was found");
+    }
+    add_env(args, "AGENTBOX_GUI", "1");
+    add_env(args, "NO_AT_BRIDGE", "1");
+    Ok(())
+}
+
+fn add_wayland(args: &mut Vec<OsString>, config: &GuiConfig) -> Result<bool> {
+    let Some((source, display)) = wayland_socket(config)? else {
+        return Ok(false);
+    };
+    if !source.exists() {
+        return Ok(false);
+    }
+
+    let target_display = if display.is_empty() {
+        "agentbox-wayland.sock".to_owned()
+    } else {
+        format!("agentbox-{}", wayland_target_name(&display))
+    };
+    add_bind_file(args, &source, &format!("/tmp/{target_display}"));
+    add_env(args, "XDG_RUNTIME_DIR", "/tmp");
+    add_env(args, "WAYLAND_DISPLAY", &target_display);
+    Ok(true)
+}
+
+fn wayland_socket(config: &GuiConfig) -> Result<Option<(PathBuf, String)>> {
+    if !config.wayland_socket.as_os_str().is_empty() {
+        let display = wayland_target_name(&config.wayland_display);
+        return Ok(Some((config.wayland_socket.clone(), display)));
+    }
+
+    let display = configured_or_env(&config.wayland_display, "WAYLAND_DISPLAY");
+    let Some(display) = display.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let source = if Path::new(&display).is_absolute() {
+        PathBuf::from(&display)
+    } else {
+        let runtime = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("WAYLAND_DISPLAY is set but XDG_RUNTIME_DIR is not"))?;
+        runtime.join(&display)
+    };
+    Ok(Some((source, display)))
+}
+
+fn wayland_target_name(display: &str) -> String {
+    display.trim().trim_start_matches('/').replace('/', "-")
+}
+
+fn add_x11(args: &mut Vec<OsString>, config: &GuiConfig, host_home: Option<&Path>) -> Result<bool> {
+    let display = configured_or_env(&config.display, "DISPLAY");
+    let Some(display) = display.filter(|value| !value.is_empty()) else {
+        return Ok(false);
+    };
+    if !config.x11_socket.exists() {
+        return Ok(false);
+    }
+
+    add_bind_path(args, &config.x11_socket, "/tmp/.X11-unix", true);
+    add_env(args, "DISPLAY", &display);
+    if let Some(xauthority) = xauthority_path(config, host_home)
+        && xauthority.is_file()
+    {
+        add_bind_file(args, &xauthority, "/tmp/agentbox-xauthority");
+        add_env(args, "XAUTHORITY", "/tmp/agentbox-xauthority");
+    }
+    Ok(true)
+}
+
+fn xauthority_path(config: &GuiConfig, host_home: Option<&Path>) -> Option<PathBuf> {
+    if !config.xauthority.as_os_str().is_empty() {
+        return Some(config.xauthority.clone());
+    }
+    if let Some(path) = env::var_os("XAUTHORITY").map(PathBuf::from) {
+        return Some(path);
+    }
+    host_home.map(|home| home.join(".Xauthority"))
+}
+
+fn configured_or_env(configured: &str, variable: &str) -> Option<String> {
+    let configured = configured.trim();
+    if configured.is_empty() {
+        env::var(variable).ok()
+    } else {
+        Some(configured.to_owned())
+    }
 }
 
 fn add_agent_credentials(
@@ -545,11 +677,21 @@ fn add_volume(args: &mut Vec<OsString>, source: &str, target: &str) {
 }
 
 fn add_bind_file(args: &mut Vec<OsString>, source: &Path, target: &str) {
+    add_bind_path(args, source, target, true);
+}
+
+fn add_bind_path(args: &mut Vec<OsString>, source: &Path, target: &str, readonly: bool) {
     args.push(OsString::from("--mount"));
+    let readonly = if readonly { ",readonly" } else { "" };
     args.push(OsString::from(format!(
-        "type=bind,src={},dst={target},readonly",
+        "type=bind,src={},dst={target}{readonly}",
         source.display()
     )));
+}
+
+fn add_env(args: &mut Vec<OsString>, name: &str, value: &str) {
+    args.push(OsString::from("--env"));
+    args.push(OsString::from(format!("{name}={value}")));
 }
 
 #[cfg(unix)]
@@ -576,6 +718,7 @@ pub fn execute(spec: &RunSpec) -> Result<u8> {
     let _credential_file = &spec.credential_file;
     let _claude_state_file = &spec.claude_state_file;
     initialize_cargo_cache(spec)?;
+    initialize_codex_desktop_cache(spec)?;
     let status = Command::new("docker")
         .args(&spec.args)
         .stdin(Stdio::inherit())
@@ -591,13 +734,32 @@ fn initialize_cargo_cache(spec: &RunSpec) -> Result<()> {
         return Ok(());
     }
 
+    initialize_owned_volume(spec, "agentbox-cargo-cache", "/cache", "Cargo cache")
+}
+
+fn initialize_codex_desktop_cache(spec: &RunSpec) -> Result<()> {
+    if !spec.codex_desktop_cache {
+        return Ok(());
+    }
+
+    initialize_owned_volume(spec, "agentbox-gui-cache", "/cache", "GUI cache")?;
+    initialize_owned_volume(spec, "agentbox-gui-local", "/cache", "GUI local data")?;
+    initialize_owned_volume(
+        spec,
+        "agentbox-codex-desktop",
+        "/cache",
+        "Codex Desktop cache",
+    )
+}
+
+fn initialize_owned_volume(spec: &RunSpec, volume: &str, target: &str, label: &str) -> Result<()> {
     let output = Command::new("docker")
-        .args(cargo_cache_init_args(spec))
+        .args(volume_init_args(spec, volume, target))
         .output()
-        .context("failed to initialize the Cargo cache volume")?;
+        .with_context(|| format!("failed to initialize the {label} volume"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "failed to make the Cargo cache writable by container user {}: {}",
+            "failed to make the {label} volume writable by container user {}: {}",
             spec.uid_gid,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -605,7 +767,7 @@ fn initialize_cargo_cache(spec: &RunSpec) -> Result<()> {
     Ok(())
 }
 
-fn cargo_cache_init_args(spec: &RunSpec) -> Vec<OsString> {
+fn volume_init_args(spec: &RunSpec, volume: &str, target: &str) -> Vec<OsString> {
     vec![
         "run".into(),
         "--rm".into(),
@@ -621,15 +783,17 @@ fn cargo_cache_init_args(spec: &RunSpec) -> Vec<OsString> {
         "--user".into(),
         "0:0".into(),
         "--mount".into(),
-        "type=volume,src=agentbox-cargo-cache,dst=/cache".into(),
+        format!("type=volume,src={volume},dst={target}").into(),
         "--entrypoint".into(),
         "/bin/sh".into(),
         "--".into(),
         spec.runtime_image.clone().into(),
         "-c".into(),
-        r#"owner="$(stat -c '%u:%g' /cache)"; if [ "$owner" != "$1" ]; then chown -R "$1" /cache; fi"#.into(),
-        "agentbox-cargo-cache-init".into(),
+        r#"owner="$(stat -c '%u:%g' "$2")"; if [ "$owner" != "$1" ]; then chown -R "$1" "$2"; fi"#
+            .into(),
+        "agentbox-volume-init".into(),
         spec.uid_gid.clone().into(),
+        target.into(),
     ]
 }
 
@@ -1014,7 +1178,7 @@ mod tests {
             session_id: None,
         })
         .unwrap();
-        let rendered = cargo_cache_init_args(&spec)
+        let rendered = volume_init_args(&spec, "agentbox-cargo-cache", "/cache")
             .iter()
             .map(|argument| argument.to_string_lossy())
             .collect::<Vec<_>>()
@@ -1025,7 +1189,7 @@ mod tests {
         assert!(rendered.contains("--user 0:0"));
         assert!(rendered.contains(&format!("-- {}", spec.runtime_image)));
         assert!(rendered.contains("agentbox-cargo-cache"));
-        assert!(rendered.ends_with(&spec.uid_gid));
+        assert!(rendered.ends_with(&format!("{} /cache", spec.uid_gid)));
     }
 
     #[test]
@@ -1050,6 +1214,115 @@ mod tests {
             assert_eq!(spec.imported_credentials, None);
             assert!(!format_command(&spec).contains("AGENTBOX_IMPORT_CREDENTIALS"));
         }
+    }
+
+    #[test]
+    fn gui_passthrough_mounts_x11_and_imports_codex_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let x11_socket = temp.path().join(".X11-unix");
+        let xauthority = temp.path().join("xauthority");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(&x11_socket).unwrap();
+        std::fs::write(home.join(".codex/auth.json"), "{}").unwrap();
+        std::fs::write(&xauthority, "cookie").unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.wayland = false;
+        config.gui.display = ":99".into();
+        config.gui.x11_socket = x11_socket.clone();
+        config.gui.xauthority = xauthority.clone();
+
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["/opt/codex-app/start.sh".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(&format!(
+            "src={},dst=/tmp/.X11-unix,readonly",
+            x11_socket.display()
+        )));
+        assert!(rendered.contains("DISPLAY=:99"));
+        assert!(rendered.contains("XAUTHORITY=/tmp/agentbox-xauthority"));
+        assert!(rendered.contains("AGENTBOX_GUI=1"));
+        assert!(rendered.contains("agentbox-gui-cache"));
+        assert!(rendered.contains("/home/agent/.cache"));
+        assert!(rendered.contains("agentbox-gui-local"));
+        assert!(rendered.contains("/home/agent/.local"));
+        assert!(!rendered.contains("agentbox-pnpm-cache"));
+        assert!(rendered.contains("agentbox-codex-desktop"));
+        assert!(rendered.contains("/agentbox/codex-desktop"));
+        assert!(!rendered.contains("agentbox-pip-cache"));
+        assert!(rendered.contains("AGENTBOX_IMPORT_CREDENTIALS=codex"));
+        assert!(spec.codex_desktop_cache);
+        assert_eq!(spec.imported_credentials.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn gui_passthrough_mounts_explicit_wayland_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let wayland_socket = temp.path().join("wayland-99");
+        std::fs::write(&wayland_socket, "").unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.x11 = false;
+        config.gui.wayland_display = "/run/user/1000/wayland-99".into();
+        config.gui.wayland_socket = wayland_socket.clone();
+
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: None,
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(&format!(
+            "src={},dst=/tmp/agentbox-run-user-1000-wayland-99,readonly",
+            wayland_socket.display()
+        )));
+        assert!(rendered.contains("XDG_RUNTIME_DIR=/tmp"));
+        assert!(rendered.contains("WAYLAND_DISPLAY=agentbox-run-user-1000-wayland-99"));
+    }
+
+    #[test]
+    fn enabled_gui_requires_a_display_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.x11 = false;
+        config.gui.wayland = false;
+
+        let error = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: None,
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no usable X11 or Wayland socket"));
     }
 
     #[test]

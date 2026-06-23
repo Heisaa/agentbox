@@ -45,6 +45,7 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
     pub caveman: CavemanConfig,
+    pub gui: GuiConfig,
     pub headroom: HeadroomConfig,
     pub security: SecurityConfig,
     pub network: NetworkConfig,
@@ -75,6 +76,20 @@ pub struct AgentConfig {
 pub struct CavemanConfig {
     pub enabled: bool,
     pub level: CavemanLevel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuiConfig {
+    pub enabled: bool,
+    pub import_codex_credentials: bool,
+    pub x11: bool,
+    pub wayland: bool,
+    pub display: String,
+    pub x11_socket: PathBuf,
+    pub xauthority: PathBuf,
+    pub wayland_display: String,
+    pub wayland_socket: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +197,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             agent: AgentConfig::default(),
             caveman: CavemanConfig::default(),
+            gui: GuiConfig::default(),
             headroom: HeadroomConfig::default(),
             security: SecurityConfig::default(),
             network: NetworkConfig::default(),
@@ -218,6 +234,22 @@ impl Default for CavemanConfig {
         Self {
             enabled: false,
             level: CavemanLevel::Full,
+        }
+    }
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            import_codex_credentials: true,
+            x11: true,
+            wayland: true,
+            display: String::new(),
+            x11_socket: PathBuf::from("/tmp/.X11-unix"),
+            xauthority: PathBuf::new(),
+            wayland_display: String::new(),
+            wayland_socket: PathBuf::new(),
         }
     }
 }
@@ -558,6 +590,13 @@ mod tests {
         assert!(!decoded.security.mount_host_home);
         assert!(!decoded.caveman.enabled);
         assert_eq!(decoded.caveman.level, CavemanLevel::Full);
+        assert!(!decoded.gui.enabled);
+        assert!(decoded.gui.import_codex_credentials);
+        assert!(decoded.gui.x11);
+        assert!(decoded.gui.wayland);
+        assert_eq!(decoded.gui.x11_socket, Path::new("/tmp/.X11-unix"));
+        assert!(decoded.gui.xauthority.as_os_str().is_empty());
+        assert!(decoded.gui.wayland_socket.as_os_str().is_empty());
         assert!(!decoded.headroom.enabled);
         assert_eq!(decoded.headroom.service, "headroom");
         assert!(decoded.runtime.dockerfile.as_os_str().is_empty());
@@ -667,8 +706,10 @@ mod tests {
         assert!(raw.get("project").is_none());
         assert_eq!(raw["env"]["defaults"]["CUSTOM_VALUE"].as_str(), Some("yes"));
         assert!(raw["caveman"].is_table());
+        assert!(raw["gui"].is_table());
         assert!(raw["headroom"].is_table());
         assert!(update.added.contains(&"caveman".into()));
+        assert!(update.added.contains(&"gui".into()));
         assert!(update.removed.contains(&"agent.allow_network".into()));
         assert_eq!(
             fs::read_to_string(update.backup_path).unwrap(),

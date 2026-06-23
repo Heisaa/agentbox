@@ -488,6 +488,8 @@ fn build_spec(
 ) -> Result<RunSpec> {
     let workspace =
         security::resolve_workspace(&context.repo_root, &context.config.workspace.mount)?;
+    validate_container_command_path(&context.config, &workspace, &command)?;
+    validate_gui_command(&context.config, &command)?;
     let mut environment =
         security::collect_environment(&context.config, &context.repo_root, allowed_secrets)?;
     if let Some(package_manager) = &context.tools.package_manager {
@@ -518,6 +520,54 @@ fn build_spec(
         interactive,
         session_id: session_id.as_deref(),
     })
+}
+
+fn validate_container_command_path(
+    config: &Config,
+    workspace: &Path,
+    command: &[String],
+) -> Result<()> {
+    let Some(executable) = command.first() else {
+        return Ok(());
+    };
+    let executable_path = Path::new(executable);
+    if !executable_path.is_absolute() {
+        return Ok(());
+    }
+
+    let container_workspace = Path::new(&config.workspace.container_path);
+    let Ok(relative) = executable_path.strip_prefix(container_workspace) else {
+        return Ok(());
+    };
+    if relative.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let host_path = workspace.join(relative);
+    if !host_path.exists() {
+        anyhow::bail!(
+            "container command `{}` maps to `{}` on the host, but that path does not exist. \
+             Build or install the launcher inside the configured workspace, or run the command \
+             with the correct container path.",
+            executable,
+            host_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_gui_command(config: &Config, command: &[String]) -> Result<()> {
+    if command
+        .first()
+        .is_some_and(|command| command == "codex-desktop")
+        && !config.gui.enabled
+    {
+        anyhow::bail!(
+            "`agentbox run codex-desktop` requires `gui.enabled = true` in {}",
+            crate::config::CONFIG_FILE
+        );
+    }
+    Ok(())
 }
 
 fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Result<Vec<String>> {
@@ -676,6 +726,14 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
         }
     );
     println!(
+        "- GUI passthrough: {}",
+        if context.config.gui.enabled {
+            enabled_gui_backends(&context.config)
+        } else {
+            "disabled".into()
+        }
+    );
+    println!(
         "- Package manager: {}",
         context
             .tools
@@ -699,6 +757,17 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
                 .join(", ")
         }
     );
+}
+
+fn enabled_gui_backends(config: &Config) -> String {
+    let mut backends = Vec::new();
+    if config.gui.wayland {
+        backends.push("Wayland");
+    }
+    if config.gui.x11 {
+        backends.push("X11");
+    }
+    backends.join(", ")
 }
 
 fn ensure_docker_available() -> Result<()> {
@@ -1091,5 +1160,49 @@ mod tests {
             spec.environment["OPENAI_BASE_URL"],
             "http://headroom:8787/v1"
         );
+    }
+
+    #[test]
+    fn missing_workspace_absolute_command_is_rejected_before_docker() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config::default();
+
+        let error = validate_container_command_path(
+            &config,
+            temp.path(),
+            &["/workspace/codex-desktop-linux/codex-app/start.sh".into()],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("maps to"));
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn existing_workspace_absolute_command_is_allowed() {
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("codex-desktop-linux/codex-app/start.sh");
+        std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, "#!/bin/sh\n").unwrap();
+        let config = Config::default();
+
+        validate_container_command_path(
+            &config,
+            temp.path(),
+            &["/workspace/codex-desktop-linux/codex-app/start.sh".into()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn codex_desktop_command_requires_gui_config() {
+        let config = Config::default();
+
+        let error = validate_gui_command(&config, &["codex-desktop".into()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("gui.enabled = true"));
     }
 }

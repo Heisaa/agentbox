@@ -13,9 +13,19 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
+        7zip \
         fd-find \
         git \
         jq \
+        fonts-liberation \
+        libasound2 \
+        libgbm1 \
+        libgtk-3-0 \
+        libnotify4 \
+        libnss3 \
+        libx11-xcb1 \
+        libxss1 \
+        libxtst6 \
         libssl-dev \
         pkg-config \
         postgresql-client \
@@ -25,6 +35,7 @@ RUN apt-get update \
         ripgrep \
         socat \
         tini \
+        unzip \
     && npm install --global pnpm@latest @anthropic-ai/claude-code @openai/codex \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*

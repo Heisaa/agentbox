@@ -209,6 +209,76 @@ account that does not exist fails fast instead of silently launching unauthentic
 Each session gets its own container-local credential copy, so multiple Codex
 accounts can be active in separate Agentbox sessions at the same time.
 
+## Codex Desktop GUI on Linux
+
+Agentbox can expose the host display to a containerized GUI app for Linux
+Codex Desktop builds such as
+[`ilysenko/codex-desktop-linux`](https://github.com/ilysenko/codex-desktop-linux).
+This keeps the app and its spawned agent process inside the Agentbox container
+while the window is visible on the host.
+
+Enable the display passthrough explicitly:
+
+```toml
+[gui]
+enabled = true
+```
+
+When enabled, Agentbox auto-detects Wayland from `WAYLAND_DISPLAY` and
+`XDG_RUNTIME_DIR`, and X11 from `DISPLAY` and `/tmp/.X11-unix`. It mounts only
+the selected display socket into the container. If an X authority file is found
+through `XAUTHORITY` or `~/.Xauthority`, that single file is mounted read-only
+as `/tmp/agentbox-xauthority`.
+
+Codex Desktop normally needs the Codex CLI/auth state at runtime, so
+`gui.import_codex_credentials = true` by default. This imports the same staged,
+container-local copy of `~/.codex/auth.json` used by `agentbox run codex`, even
+when the command is a desktop launcher rather than the `codex` executable.
+Disable it for non-Codex GUI tools:
+
+```toml
+[gui]
+enabled = true
+import_codex_credentials = false
+```
+
+You can override display discovery when needed:
+
+```toml
+[gui]
+enabled = true
+display = ":1"
+x11_socket = "/tmp/.X11-unix"
+wayland_display = "wayland-1"
+wayland_socket = "/run/user/1000/wayland-1"
+```
+
+With GUI passthrough enabled, the full-stack image installs the Linux wrapper
+on first use into a shared `agentbox-codex-desktop` Docker volume and exposes a
+per-run `codex-desktop` launcher on `PATH`:
+
+```bash
+agentbox run codex-desktop
+```
+
+The first GUI-enabled run can take several minutes because it clones
+`codex-desktop-linux`, downloads the upstream Codex DMG, and generates
+`codex-app/`. Later workspaces reuse the shared Docker volume. GUI runs also
+mount writable `agentbox-gui-cache` and `agentbox-gui-local` volumes at
+`/home/agent/.cache` and `/home/agent/.local` for desktop caches and state. To
+inspect or override the generated launcher path inside the container, use:
+
+```bash
+agentbox run /agentbox/codex-desktop/codex-desktop-linux/codex-app/start.sh
+```
+
+Build failures print the last log lines and persist the complete log in the
+shared volume at `/agentbox/codex-desktop/install.log`.
+
+The standard full-stack image includes the common Electron runtime libraries
+and build tools needed by the Linux wrapper. If the app still reports missing
+system libraries, add them in `.agentbox/Dockerfile` and run `agentbox build`.
+
 `agentbox init` creates `.agentbox/config.toml`, an ignored local development
 environment file location, and an example env file. Edit `runtime.image` to use
 a custom image directly, or configure `runtime.dockerfile` to derive a
@@ -309,6 +379,10 @@ configuration, package-manager credentials, or Docker socket. The read-only
 `/etc/localtime` system file is mounted to match the host timezone. Agentbox
 imports only the selected Claude Code or Codex credential file as described
 above.
+
+GUI passthrough is disabled by default because X11 and Wayland sockets allow a
+containerized desktop app to interact with the user's graphical session. Enable
+`gui.enabled` only for projects where that host display access is intentional.
 
 The MVP uses Docker's normal network controls. Joining a Compose network
 usually also permits internet access. Set `network.mode = "none"` for a fully
