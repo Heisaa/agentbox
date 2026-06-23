@@ -142,6 +142,97 @@ print_codex_desktop_log_tail() {
     fi
 }
 
+# Seed Codex Desktop's persisted state so it launches ready to work:
+#   * "full access" (YOLO) mode so it never pauses for approvals. Agentbox
+#     already isolates the agent inside this container, so the app's own
+#     sandbox/approval prompts are redundant; this mirrors the
+#     `--dangerously-bypass-approvals-and-sandbox` flag the Codex CLI receives.
+#   * the workspace folder open by default (the container working directory).
+#   * the welcome / intro onboarding screens marked complete so they are skipped.
+# Set AGENTBOX_CODEX_DESKTOP_FULL_ACCESS=0 to keep the app's built-in approval
+# default.
+configure_codex_desktop_defaults() {
+    AGENTBOX_CODEX_DESKTOP_STATE="${CODEX_HOME:-$HOME/.codex}/.codex-global-state.json" \
+    AGENTBOX_CODEX_DESKTOP_FULL_ACCESS="${AGENTBOX_CODEX_DESKTOP_FULL_ACCESS:-1}" \
+    AGENTBOX_CODEX_DESKTOP_WORKSPACE="$(pwd 2>/dev/null || printf '/workspace')" \
+        python3 - <<'PY' || { printf '%s\n' "- could not seed defaults" >&2; return 0; }
+import json
+import os
+import time
+
+path = os.environ["AGENTBOX_CODEX_DESKTOP_STATE"]
+full_access = os.environ.get("AGENTBOX_CODEX_DESKTOP_FULL_ACCESS", "1") != "0"
+workspace = os.environ.get("AGENTBOX_CODEX_DESKTOP_WORKSPACE", "")
+
+try:
+    with open(path) as handle:
+        state = json.load(handle)
+    if not isinstance(state, dict):
+        state = {}
+except (FileNotFoundError, ValueError):
+    state = {}
+
+atoms = state.get("electron-persisted-atom-state")
+if not isinstance(atoms, dict):
+    atoms = {}
+    state["electron-persisted-atom-state"] = atoms
+
+if full_access:
+    modes = atoms.get("agent-mode-by-host-id")
+    if not isinstance(modes, dict):
+        modes = {}
+    # Force every known host (and the default "local" host) to full-access.
+    modes = {host: "full-access" for host in modes}
+    modes.setdefault("local", "full-access")
+    atoms["agent-mode-by-host-id"] = modes
+    # Keep full-access visible in the composer mode picker.
+    visibility = atoms.get("composer-permission-mode-visibility")
+    if not isinstance(visibility, dict):
+        visibility = {}
+    visibility["full-access"] = True
+    atoms["composer-permission-mode-visibility"] = visibility
+
+# Open the workspace folder by default; the app reads roots[0] as the active
+# project. Keep it first while preserving any other folders the user added.
+if workspace:
+    for key in (
+        "electron-saved-workspace-roots",
+        "project-order",
+        "active-workspace-roots",
+    ):
+        roots = state.get(key)
+        if not isinstance(roots, list):
+            roots = []
+        roots = [root for root in roots if root != workspace]
+        roots.insert(0, workspace)
+        state[key] = roots
+
+# Mark onboarding complete so the welcome / intro screens are skipped. The app
+# shows them when last_completed_onboarding is unset or older than its cutoff,
+# so stamp it with the current time.
+atoms["electron:onboarding-welcome-pending"] = False
+atoms["electron:onboarding-projectless-completed"] = True
+atoms["last_completed_onboarding"] = int(time.time())
+role_state = atoms.get("electron:onboarding-welcome-v2-role-state")
+if not isinstance(role_state, dict) or not role_state.get("roles"):
+    atoms["electron:onboarding-welcome-v2-role-state"] = {
+        "roles": ["engineering"],
+        "personalizedSuggestionsEnabled": False,
+        "workMode": "coding",
+    }
+
+os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w") as handle:
+    json.dump(state, handle)
+os.replace(tmp, path)
+PY
+    if [ "${AGENTBOX_CODEX_DESKTOP_FULL_ACCESS:-1}" != "0" ]; then
+        printf '%s\n' "- full-access (no approval prompts) enabled"
+    fi
+    printf '%s\n' "- opens $(pwd 2>/dev/null || printf '/workspace'); onboarding skipped"
+}
+
 ensure_codex_desktop() {
     if [ "${AGENTBOX_GUI:-0}" != "1" ]; then
         return 0
@@ -164,15 +255,16 @@ ensure_codex_desktop() {
         return 0
     fi
 
+    printf '%s\n' "Codex Desktop:"
+    configure_codex_desktop_defaults
+
     if [ -x "$launcher" ]; then
         mkdir -p "$agentbox_bin"
         ln -sfn "$launcher" "$link"
-        printf '%s\n' "Codex Desktop:"
         printf '%s\n' "- available at $link"
         return 0
     fi
 
-    printf '%s\n' "Codex Desktop:"
     printf '%s\n' "- building Linux wrapper; this can take several minutes on first use"
     if ! mkdir -p "$root" "$agentbox_bin"; then
         printf '%s\n' "- failed to prepare Codex Desktop directories" >&2
