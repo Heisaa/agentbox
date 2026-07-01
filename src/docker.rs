@@ -3,9 +3,16 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{IsTerminal, Write},
-    path::{Path, PathBuf},
+    io::{self, IsTerminal, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -24,17 +31,29 @@ pub struct RunSpec {
     pub workspace_write: bool,
     pub uid_gid: String,
     pub imported_credentials: Option<String>,
+    pub host_browser: bool,
     runtime_image: String,
     cargo_cache: bool,
+    gui_cache: bool,
     codex_desktop_cache: bool,
+    claude_desktop_cache: bool,
     credential_file: Option<NamedTempFile>,
     claude_state_file: Option<NamedTempFile>,
+    host_browser_bridge: Option<HostBrowserBridge>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ImageBuildSpec {
     pub args: Vec<OsString>,
     pub image: String,
+}
+
+#[derive(Debug)]
+struct HostBrowserBridge {
+    listener: TcpListener,
+    url: String,
+    token: String,
+    container_name: String,
 }
 
 pub struct BuildInput<'a> {
@@ -76,7 +95,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     let container_name = container_name(input.repo_root, input.session_id);
     args.extend([
         OsString::from("--name"),
-        OsString::from(container_name),
+        OsString::from(&container_name),
         OsString::from("--user"),
         OsString::from(&uid_gid),
         OsString::from("--workdir"),
@@ -128,6 +147,12 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
     args.push(OsString::from("--network"));
     args.push(OsString::from(&network));
 
+    let host_browser_bridge = if config.host_browser.enabled && network != "none" {
+        Some(add_host_browser(&mut args, &container_name)?)
+    } else {
+        None
+    };
+
     let readonly = if config.workspace.write {
         ""
     } else {
@@ -140,6 +165,12 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         config.workspace.container_path,
         readonly
     )));
+    add_worktree_git_mounts(
+        &mut args,
+        input.workspace,
+        Path::new(&config.workspace.container_path),
+        config.workspace.write,
+    )?;
 
     args.push(OsString::from("--tmpfs"));
     args.push(OsString::from("/tmp:rw,nosuid,nodev,exec,size=2g"));
@@ -184,6 +215,14 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
             "/agentbox/codex-desktop",
         );
     }
+    let claude_desktop_requested = command_requests_claude_desktop(&command);
+    if config.gui.enabled && claude_desktop_requested {
+        add_volume(
+            &mut args,
+            "agentbox-claude-desktop",
+            "/agentbox/claude-desktop",
+        );
+    }
 
     let credential_command = credential_command(config, &command);
     let (imported_credentials, credential_file) = add_agent_credentials(
@@ -202,6 +241,7 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         args.push(OsString::from("--env"));
         args.push(OsString::from(format!("{name}={value}")));
     }
+    add_git_workspace_config(&mut args, &config.workspace.container_path);
     args.push(OsString::from("--env"));
     args.push(OsString::from("HOME=/home/agent"));
     args.push(OsString::from("--env"));
@@ -224,7 +264,12 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         "AGENTBOX_CAVEMAN={}",
         u8::from(config.caveman.enabled)
     )));
-    add_gui(&mut args, &config.gui, input.host_home)?;
+    add_gui(
+        &mut args,
+        &config.gui,
+        input.host_home,
+        claude_desktop_requested,
+    )?;
 
     let runtime_image = runtime_image(config, input.repo_root);
     // Terminate option parsing so a repo-supplied image reference cannot be
@@ -240,11 +285,15 @@ pub fn build_run_spec(input: BuildInput<'_>) -> Result<RunSpec> {
         workspace_write: config.workspace.write,
         uid_gid,
         imported_credentials,
+        host_browser: host_browser_bridge.is_some(),
         runtime_image,
         cargo_cache: config.caches.cargo,
+        gui_cache: config.gui.enabled,
         codex_desktop_cache: config.gui.enabled,
+        claude_desktop_cache: config.gui.enabled && claude_desktop_requested,
         credential_file,
         claude_state_file,
+        host_browser_bridge,
     })
 }
 
@@ -397,25 +446,79 @@ pub(crate) fn container_name(repo_root: &Path, session_id: Option<&str>) -> Stri
 }
 
 fn update_agent(command: &[String]) -> Option<&'static str> {
-    match command.first().map(String::as_str) {
-        Some("claude") => Some("claude"),
-        Some("codex") => Some("codex"),
+    match command.first() {
+        Some(command) if command == "claude" => Some("claude"),
+        Some(command)
+            if command == "codex"
+                || command == "codex-login"
+                || command_requests_codex_desktop(command) =>
+        {
+            Some("codex")
+        }
         _ => None,
     }
 }
 
-fn credential_command(config: &Config, command: &[String]) -> Vec<String> {
-    if config.gui.enabled
-        && config.gui.import_codex_credentials
-        && !matches!(
-            command.first().map(String::as_str),
-            Some("claude" | "codex")
-        )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeDesktopBackend {
+    Auto,
+    X11,
+    Wayland,
+}
+
+fn claude_desktop_backend() -> ClaudeDesktopBackend {
+    if env::var("AGENTBOX_CLAUDE_DESKTOP_BACKEND").is_ok_and(|value| value == "x11")
+        || env::var("CLAUDE_USE_WAYLAND").is_ok_and(|value| value == "0")
     {
-        vec!["codex".into()]
+        ClaudeDesktopBackend::X11
+    } else if env::var("AGENTBOX_CLAUDE_DESKTOP_BACKEND").is_ok_and(|value| value == "wayland")
+        || env::var("CLAUDE_USE_WAYLAND").is_ok_and(|value| value == "1")
+    {
+        ClaudeDesktopBackend::Wayland
     } else {
-        command.to_vec()
+        ClaudeDesktopBackend::Auto
     }
+}
+
+fn command_requests_codex_desktop(command: &str) -> bool {
+    command == "codex-desktop" || command.contains("/codex-desktop/")
+}
+
+fn command_requests_codex_login(command: &str) -> bool {
+    command == "codex-login"
+}
+
+fn command_requests_claude_desktop(command: &[String]) -> bool {
+    command
+        .first()
+        .is_some_and(|command| command_requests_claude_desktop_name(command))
+}
+
+fn command_requests_claude_desktop_name(command: &str) -> bool {
+    command == "claude-desktop" || command.contains("claude-desktop")
+}
+
+fn credential_command(config: &Config, command: &[String]) -> Vec<String> {
+    if !config.gui.enabled {
+        return command.to_vec();
+    }
+
+    // Desktop GUI apps launch through a wrapper script rather than the bare
+    // `claude`/`codex` executable, so map each desktop launcher to the
+    // credential file its agent expects. Claude Desktop launchers carry
+    // `claude-desktop` in their path; anything else (including Codex Desktop and
+    // bare launcher paths) falls back to Codex, matching `agentbox run codex`.
+    let first = command.first().map(String::as_str);
+    if first.is_some_and(command_requests_claude_desktop_name) {
+        if config.gui.import_claude_credentials {
+            return vec!["claude".into()];
+        }
+    } else if first.is_some_and(command_requests_codex_login) {
+        return command.to_vec();
+    } else if config.gui.import_codex_credentials && !matches!(first, Some("claude" | "codex")) {
+        return vec!["codex".into()];
+    }
+    command.to_vec()
 }
 
 pub(crate) fn codex_account_from_command_name(command_name: &str) -> Result<Option<&str>> {
@@ -441,9 +544,18 @@ fn validate_codex_account_name(account: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_gui(args: &mut Vec<OsString>, config: &GuiConfig, host_home: Option<&Path>) -> Result<()> {
+fn add_gui(
+    args: &mut Vec<OsString>,
+    config: &GuiConfig,
+    host_home: Option<&Path>,
+    claude_desktop: bool,
+) -> Result<()> {
     if !config.enabled {
         return Ok(());
+    }
+
+    if claude_desktop {
+        return add_claude_desktop_gui(args, config, host_home);
     }
 
     let mut added = false;
@@ -452,6 +564,44 @@ fn add_gui(args: &mut Vec<OsString>, config: &GuiConfig, host_home: Option<&Path
     }
     if config.x11 && add_x11(args, config, host_home)? {
         added = true;
+    }
+    if !added {
+        anyhow::bail!("GUI passthrough is enabled, but no usable X11 or Wayland socket was found");
+    }
+    add_env(args, "AGENTBOX_GUI", "1");
+    add_env(args, "NO_AT_BRIDGE", "1");
+    Ok(())
+}
+
+fn add_claude_desktop_gui(
+    args: &mut Vec<OsString>,
+    config: &GuiConfig,
+    host_home: Option<&Path>,
+) -> Result<()> {
+    let mut added = false;
+    match claude_desktop_backend() {
+        ClaudeDesktopBackend::X11 => {
+            if config.x11 && add_x11(args, config, host_home)? {
+                add_env(args, "CLAUDE_USE_WAYLAND", "0");
+                added = true;
+            }
+        }
+        ClaudeDesktopBackend::Wayland => {
+            if config.wayland && add_wayland(args, config)? {
+                add_env(args, "CLAUDE_USE_WAYLAND", "1");
+                add_env(args, "XDG_SESSION_TYPE", "wayland");
+                added = true;
+            }
+        }
+        ClaudeDesktopBackend::Auto => {
+            if config.x11 && add_x11(args, config, host_home)? {
+                added = true;
+            } else if config.wayland && add_wayland(args, config)? {
+                add_env(args, "CLAUDE_USE_WAYLAND", "1");
+                add_env(args, "XDG_SESSION_TYPE", "wayland");
+                added = true;
+            }
+        }
     }
     if !added {
         anyhow::bail!("GUI passthrough is enabled, but no usable X11 or Wayland socket was found");
@@ -689,9 +839,233 @@ fn add_bind_path(args: &mut Vec<OsString>, source: &Path, target: &str, readonly
     )));
 }
 
+fn add_worktree_git_mounts(
+    args: &mut Vec<OsString>,
+    workspace: &Path,
+    container_workspace: &Path,
+    writable: bool,
+) -> Result<()> {
+    let Some(worktree) = linked_worktree_git_paths(workspace, container_workspace)? else {
+        return Ok(());
+    };
+
+    let readonly = !writable;
+    add_git_metadata_mount(
+        args,
+        workspace,
+        &worktree.common_dir,
+        &worktree.common_target,
+        readonly,
+    );
+    if worktree.git_dir != worktree.common_dir
+        && !worktree.git_dir.starts_with(&worktree.common_dir)
+    {
+        add_git_metadata_mount(
+            args,
+            workspace,
+            &worktree.git_dir,
+            &worktree.git_target,
+            readonly,
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct WorktreeGitPaths {
+    git_dir: PathBuf,
+    git_target: PathBuf,
+    common_dir: PathBuf,
+    common_target: PathBuf,
+}
+
+fn linked_worktree_git_paths(
+    workspace: &Path,
+    container_workspace: &Path,
+) -> Result<Option<WorktreeGitPaths>> {
+    let git_file = workspace.join(".git");
+    if !git_file.is_file() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&git_file)
+        .with_context(|| format!("failed to read {}", git_file.display()))?;
+    let Some(raw_git_dir) = parse_gitdir_file(&contents) else {
+        return Ok(None);
+    };
+
+    let git_dir = resolve_host_git_path(workspace, raw_git_dir)
+        .with_context(|| format!("failed to resolve gitdir from {}", git_file.display()))?;
+    let git_target =
+        resolve_container_git_path(container_workspace, raw_git_dir).with_context(|| {
+            format!(
+                "failed to resolve container gitdir for {}",
+                git_file.display()
+            )
+        })?;
+    let commondir_file = git_dir.join("commondir");
+    let (common_dir, common_target) = if commondir_file.is_file() {
+        let contents = fs::read_to_string(&commondir_file)
+            .with_context(|| format!("failed to read {}", commondir_file.display()))?;
+        let raw_common_dir = contents.trim();
+        if raw_common_dir.is_empty() {
+            (git_dir.clone(), git_target.clone())
+        } else {
+            (
+                resolve_host_git_path(&git_dir, raw_common_dir).with_context(|| {
+                    format!(
+                        "failed to resolve commondir from {}",
+                        commondir_file.display()
+                    )
+                })?,
+                resolve_container_git_path(&git_target, raw_common_dir).with_context(|| {
+                    format!(
+                        "failed to resolve container commondir for {}",
+                        commondir_file.display()
+                    )
+                })?,
+            )
+        }
+    } else {
+        (git_dir.clone(), git_target.clone())
+    };
+
+    Ok(Some(WorktreeGitPaths {
+        git_dir,
+        git_target,
+        common_dir,
+        common_target,
+    }))
+}
+
+fn parse_gitdir_file(contents: &str) -> Option<&str> {
+    contents
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_host_git_path(base: &Path, raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    fs::canonicalize(&path)
+        .with_context(|| format!("git metadata path does not exist: {}", path.display()))
+}
+
+fn resolve_container_git_path(base: &Path, raw: &str) -> Result<PathBuf> {
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    normalize_absolute_path(&path)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "container git metadata path must be absolute: {}",
+            path.display()
+        );
+    }
+
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::Prefix(_) => {
+                anyhow::bail!(
+                    "unsupported container git metadata path: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn add_git_metadata_mount(
+    args: &mut Vec<OsString>,
+    workspace: &Path,
+    source: &Path,
+    target: &Path,
+    readonly: bool,
+) {
+    if source.starts_with(workspace) {
+        return;
+    }
+    add_bind_path(args, source, &target.to_string_lossy(), readonly);
+}
+
 fn add_env(args: &mut Vec<OsString>, name: &str, value: &str) {
     args.push(OsString::from("--env"));
     args.push(OsString::from(format!("{name}={value}")));
+}
+
+fn add_git_workspace_config(args: &mut Vec<OsString>, workspace: &str) {
+    add_env(args, "GIT_CONFIG_COUNT", "1");
+    add_env(args, "GIT_CONFIG_KEY_0", "safe.directory");
+    add_env(args, "GIT_CONFIG_VALUE_0", workspace);
+}
+
+fn add_host_browser(args: &mut Vec<OsString>, container_name: &str) -> Result<HostBrowserBridge> {
+    let listener = TcpListener::bind(("0.0.0.0", 0))
+        .context("failed to start host browser bridge listener")?;
+    let port = listener
+        .local_addr()
+        .context("failed to read host browser bridge address")?
+        .port();
+    let token = browser_bridge_token();
+    args.push(OsString::from("--add-host"));
+    args.push(OsString::from("host.docker.internal:host-gateway"));
+    add_env(
+        args,
+        "AGENTBOX_HOST_BROWSER_URL",
+        &format!("http://host.docker.internal:{port}/open"),
+    );
+    add_env(args, "AGENTBOX_HOST_BROWSER_TOKEN", &token);
+    add_env(args, "BROWSER", "/usr/local/bin/agentbox-open");
+    Ok(HostBrowserBridge {
+        listener,
+        url: format!("http://127.0.0.1:{port}/open"),
+        token,
+        container_name: container_name.to_owned(),
+    })
+}
+
+fn browser_bridge_token() -> String {
+    let mut bytes = [0_u8; 32];
+    if let Ok(mut file) = fs::File::open("/dev/urandom")
+        && file.read_exact(&mut bytes).is_ok()
+    {
+        return hex(&bytes);
+    }
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    hex(format!("{}:{now}", std::process::id()).as_bytes())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(DIGITS[(byte >> 4) as usize] as char);
+        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 #[cfg(unix)]
@@ -718,7 +1092,13 @@ pub fn execute(spec: &RunSpec) -> Result<u8> {
     let _credential_file = &spec.credential_file;
     let _claude_state_file = &spec.claude_state_file;
     initialize_cargo_cache(spec)?;
-    initialize_codex_desktop_cache(spec)?;
+    initialize_gui_cache(spec)?;
+    initialize_desktop_caches(spec)?;
+    let _host_browser_worker = spec
+        .host_browser_bridge
+        .as_ref()
+        .map(HostBrowserWorker::start)
+        .transpose()?;
     let status = Command::new("docker")
         .args(&spec.args)
         .stdin(Stdio::inherit())
@@ -729,6 +1109,453 @@ pub fn execute(spec: &RunSpec) -> Result<u8> {
     Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
 }
 
+struct HostBrowserWorker {
+    shutdown: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+    wake_url: String,
+    callback_forwarders: Arc<Mutex<BTreeMap<u16, CallbackForwarder>>>,
+}
+
+impl HostBrowserWorker {
+    fn start(bridge: &HostBrowserBridge) -> Result<Self> {
+        let listener = bridge
+            .listener
+            .try_clone()
+            .context("failed to clone host browser bridge listener")?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure host browser bridge listener")?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let token = bridge.token.clone();
+        let container_name = bridge.container_name.clone();
+        let callback_forwarders = Arc::new(Mutex::new(BTreeMap::new()));
+        let thread_callback_forwarders = callback_forwarders.clone();
+        let join = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_browser_request(
+                        stream,
+                        &token,
+                        &container_name,
+                        &thread_callback_forwarders,
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            shutdown,
+            join: Some(join),
+            wake_url: bridge.url.clone(),
+            callback_forwarders,
+        })
+    }
+}
+
+impl Drop for HostBrowserWorker {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(
+            self.wake_url
+                .trim_start_matches("http://")
+                .trim_end_matches("/open"),
+        );
+        if let Ok(mut forwarders) = self.callback_forwarders.lock() {
+            forwarders.clear();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn handle_browser_request(
+    mut stream: TcpStream,
+    token: &str,
+    container_name: &str,
+    callback_forwarders: &Arc<Mutex<BTreeMap<u16, CallbackForwarder>>>,
+) {
+    let response = match read_browser_request(&mut stream) {
+        Ok(request) if request.token == token => {
+            let result = ensure_callback_forwarders(
+                callback_forwarders,
+                container_name,
+                loopback_callback_ports(&request.url),
+            )
+            .and_then(|()| open_host_browser(&request.url));
+            match result {
+                Ok(()) => ("204 No Content", ""),
+                Err(_) => ("502 Bad Gateway", "could not open host browser\n"),
+            }
+        }
+        Ok(_) => ("403 Forbidden", "invalid token\n"),
+        Err(_) => ("400 Bad Request", "invalid request\n"),
+    };
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        response.0,
+        response.1.len(),
+        response.1
+    );
+}
+
+struct BrowserOpenRequest {
+    token: String,
+    url: String,
+}
+
+fn read_browser_request(stream: &mut TcpStream) -> Result<BrowserOpenRequest> {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let count = stream
+            .read(&mut chunk)
+            .context("failed to read browser request")?;
+        if count == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..count]);
+        if buffer.len() > 65_536 {
+            anyhow::bail!("browser request is too large");
+        }
+        if let Some((header_end, content_length)) = browser_request_shape(&buffer)?
+            && buffer.len() >= header_end + content_length
+        {
+            break;
+        }
+    }
+
+    let Some((header_end, content_length)) = browser_request_shape(&buffer)? else {
+        anyhow::bail!("browser request is incomplete");
+    };
+    if buffer.len() < header_end + content_length {
+        anyhow::bail!("browser request body is incomplete");
+    }
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let mut lines = headers.lines();
+    let request_line = lines.next().unwrap_or_default();
+    if request_line != "POST /open HTTP/1.1" && request_line != "POST /open HTTP/1.0" {
+        anyhow::bail!("unsupported browser request");
+    }
+    let token = lines
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("x-agentbox-token"))
+        .map(|(_, value)| value.trim().to_owned())
+        .ok_or_else(|| anyhow::anyhow!("missing token"))?;
+    let body = &buffer[header_end..header_end + content_length];
+    let url = String::from_utf8(body.to_vec())
+        .context("browser URL is not valid UTF-8")?
+        .trim()
+        .to_owned();
+    validate_browser_url(&url)?;
+    Ok(BrowserOpenRequest { token, url })
+}
+
+fn browser_request_shape(buffer: &[u8]) -> Result<Option<(usize, usize)>> {
+    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return Ok(None);
+    };
+    let header_end = header_end + 4;
+    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose()
+        .context("invalid content length")?
+        .unwrap_or(0);
+    Ok(Some((header_end, content_length)))
+}
+
+fn validate_browser_url(url: &str) -> Result<()> {
+    if url.len() > 8192 || url.chars().any(char::is_control) {
+        anyhow::bail!("browser URL is invalid");
+    }
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        anyhow::bail!("browser URL must start with http:// or https://");
+    }
+    Ok(())
+}
+
+fn loopback_callback_ports(url: &str) -> Vec<u16> {
+    let mut candidates = vec![url.to_owned()];
+    let mut current = url.to_owned();
+    for _ in 0..3 {
+        let decoded = percent_decode(&current);
+        if decoded == current {
+            break;
+        }
+        candidates.push(decoded.clone());
+        current = decoded;
+    }
+
+    let mut ports = Vec::new();
+    for candidate in candidates {
+        collect_loopback_ports(&candidate, "localhost:", &mut ports);
+        collect_loopback_ports(&candidate, "127.0.0.1:", &mut ports);
+        collect_loopback_ports(&candidate, "[::1]:", &mut ports);
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            decoded.push(high << 4 | low);
+            index += 3;
+            continue;
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn collect_loopback_ports(value: &str, marker: &str, ports: &mut Vec<u16>) {
+    let mut offset = 0;
+    while let Some(position) = value[offset..].find(marker) {
+        let port_start = offset + position + marker.len();
+        let port_digits = value[port_start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if let Ok(port) = port_digits.parse::<u16>()
+            && port != 0
+        {
+            ports.push(port);
+        }
+        offset = port_start
+            .saturating_add(port_digits.len())
+            .max(offset + position + 1);
+    }
+}
+
+struct CallbackForwarder {
+    shutdown: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for CallbackForwarder {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn ensure_callback_forwarders(
+    forwarders: &Arc<Mutex<BTreeMap<u16, CallbackForwarder>>>,
+    container_name: &str,
+    ports: Vec<u16>,
+) -> Result<()> {
+    if ports.is_empty() {
+        return Ok(());
+    }
+
+    let mut forwarders = forwarders
+        .lock()
+        .map_err(|_| anyhow::anyhow!("callback forwarder lock is poisoned"))?;
+    for port in ports {
+        if forwarders.contains_key(&port) {
+            continue;
+        }
+        forwarders.insert(port, CallbackForwarder::start(container_name, port)?);
+    }
+    Ok(())
+}
+
+impl CallbackForwarder {
+    fn start(container_name: &str, port: u16) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .with_context(|| format!("failed to bind host callback port {port}"))?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure callback forwarder listener")?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let container_name = container_name.to_owned();
+        let join = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let container_name = container_name.clone();
+                        thread::spawn(move || {
+                            let _ = forward_callback_connection(stream, &container_name, port);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(Self {
+            shutdown,
+            join: Some(join),
+        })
+    }
+}
+
+fn forward_callback_connection(
+    mut stream: TcpStream,
+    container_name: &str,
+    port: u16,
+) -> Result<()> {
+    let request = normalize_callback_request(
+        read_http_message(&mut stream).context("failed to read callback request")?,
+    )?;
+    let mut child = Command::new("docker")
+        .args([
+            "exec",
+            "-i",
+            container_name,
+            "sh",
+            "-lc",
+            &format!("exec socat STDIO TCP:127.0.0.1:{port}"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to start callback bridge in container")?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .context("callback bridge stdin is unavailable")?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .context("callback bridge stdout is unavailable")?;
+    child_stdin
+        .write_all(&request)
+        .context("failed to forward callback request to container")?;
+    drop(child_stdin);
+    io::copy(&mut child_stdout, &mut stream)
+        .context("failed to forward callback response from container")?;
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
+fn read_http_message(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let count = stream
+            .read(&mut chunk)
+            .context("failed to read HTTP request")?;
+        if count == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..count]);
+        if buffer.len() > 1_048_576 {
+            anyhow::bail!("HTTP request is too large");
+        }
+        if let Some((header_end, content_length)) = browser_request_shape(&buffer)?
+            && buffer.len() >= header_end + content_length
+        {
+            break;
+        }
+    }
+    if buffer.is_empty() {
+        anyhow::bail!("HTTP request is empty");
+    }
+    Ok(buffer)
+}
+
+fn normalize_callback_request(request: Vec<u8>) -> Result<Vec<u8>> {
+    let Some(header_end) = request
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + 4)
+    else {
+        anyhow::bail!("HTTP request is missing headers");
+    };
+    let headers = String::from_utf8_lossy(&request[..header_end]);
+    let mut lines = headers.lines();
+    let request_line = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("HTTP request line is missing"))?;
+    let body = &request[header_end..];
+    let mut normalized = Vec::with_capacity(request.len() + 64);
+    write!(normalized, "{request_line}\r\n").context("failed to normalize callback request")?;
+    write!(normalized, "Connection: close\r\n")
+        .context("failed to normalize callback connection")?;
+    for line in lines {
+        let Some((name, _)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("proxy-connection")
+            || name.eq_ignore_ascii_case("keep-alive")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+            || name.eq_ignore_ascii_case("upgrade")
+        {
+            continue;
+        }
+        write!(normalized, "{line}\r\n").context("failed to copy callback header")?;
+    }
+    normalized.extend_from_slice(b"\r\n");
+    normalized.extend_from_slice(body);
+    Ok(normalized)
+}
+
+#[cfg(target_os = "macos")]
+fn open_host_browser(url: &str) -> Result<()> {
+    spawn_browser_command("open", [url])
+}
+
+#[cfg(target_os = "windows")]
+fn open_host_browser(url: &str) -> Result<()> {
+    spawn_browser_command("cmd", ["/C", "start", "", url])
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_host_browser(url: &str) -> Result<()> {
+    spawn_browser_command("xdg-open", [url])
+        .or_else(|_| spawn_browser_command("gio", ["open", url]))
+}
+
+fn spawn_browser_command<const N: usize>(program: &str, args: [&str; N]) -> Result<()> {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("failed to execute {program}"))?;
+    Ok(())
+}
+
 fn initialize_cargo_cache(spec: &RunSpec) -> Result<()> {
     if !spec.cargo_cache {
         return Ok(());
@@ -737,19 +1564,33 @@ fn initialize_cargo_cache(spec: &RunSpec) -> Result<()> {
     initialize_owned_volume(spec, "agentbox-cargo-cache", "/cache", "Cargo cache")
 }
 
-fn initialize_codex_desktop_cache(spec: &RunSpec) -> Result<()> {
-    if !spec.codex_desktop_cache {
+fn initialize_gui_cache(spec: &RunSpec) -> Result<()> {
+    if !spec.gui_cache {
         return Ok(());
     }
 
     initialize_owned_volume(spec, "agentbox-gui-cache", "/cache", "GUI cache")?;
-    initialize_owned_volume(spec, "agentbox-gui-local", "/cache", "GUI local data")?;
-    initialize_owned_volume(
-        spec,
-        "agentbox-codex-desktop",
-        "/cache",
-        "Codex Desktop cache",
-    )
+    initialize_owned_volume(spec, "agentbox-gui-local", "/cache", "GUI local data")
+}
+
+fn initialize_desktop_caches(spec: &RunSpec) -> Result<()> {
+    if spec.codex_desktop_cache {
+        initialize_owned_volume(
+            spec,
+            "agentbox-codex-desktop",
+            "/cache",
+            "Codex Desktop cache",
+        )?;
+    }
+    if spec.claude_desktop_cache {
+        initialize_owned_volume(
+            spec,
+            "agentbox-claude-desktop",
+            "/cache",
+            "Claude Desktop cache",
+        )?;
+    }
+    Ok(())
 }
 
 fn initialize_owned_volume(spec: &RunSpec, volume: &str, target: &str, label: &str) -> Result<()> {
@@ -856,6 +1697,14 @@ mod tests {
         assert!(rendered.contains("AGENTBOX_AUTO_UPDATE=1"));
         assert!(!rendered.contains("AGENTBOX_UPDATE_AGENT="));
         assert!(rendered.contains("AGENTBOX_CAVEMAN=0"));
+        assert!(rendered.contains("GIT_CONFIG_COUNT=1"));
+        assert!(rendered.contains("GIT_CONFIG_KEY_0=safe.directory"));
+        assert!(rendered.contains("GIT_CONFIG_VALUE_0=/workspace"));
+        assert!(rendered.contains("--add-host host.docker.internal:host-gateway"));
+        assert!(rendered.contains("AGENTBOX_HOST_BROWSER_URL=http://host.docker.internal:"));
+        assert!(rendered.contains("AGENTBOX_HOST_BROWSER_TOKEN=<redacted>"));
+        assert!(rendered.contains("BROWSER=/usr/local/bin/agentbox-open"));
+        assert!(spec.host_browser);
         assert!(rendered.contains("--cap-drop ALL"));
         assert!(rendered.contains("--pids-limit 2048"));
         assert!(rendered.contains("--network bridge"));
@@ -869,6 +1718,74 @@ mod tests {
             assert!(rendered.contains(&format!("TZ={timezone}")));
         }
         assert!(!rendered.contains(",rw"));
+    }
+
+    #[test]
+    fn host_browser_bridge_can_be_disabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.host_browser.enabled = false;
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: None,
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(!rendered.contains("AGENTBOX_HOST_BROWSER_URL"));
+        assert!(!rendered.contains("host.docker.internal:host-gateway"));
+        assert!(!spec.host_browser);
+    }
+
+    #[test]
+    fn host_browser_bridge_is_skipped_without_network() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.network.mode = NetworkMode::None;
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: None,
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains("--network none"));
+        assert!(!rendered.contains("AGENTBOX_HOST_BROWSER_URL"));
+        assert!(!spec.host_browser);
+    }
+
+    #[test]
+    fn loopback_callback_ports_are_extracted_from_auth_urls() {
+        let url = "https://auth.example/start?redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fcallback&other=http%253A%252F%252F127.0.0.1%253A4567%252Fdone";
+
+        assert_eq!(loopback_callback_ports(url), vec![1455, 4567]);
+    }
+
+    #[test]
+    fn callback_requests_are_normalized_for_container_loopback() {
+        let request = b"GET /callback?code=abc HTTP/1.1\r\nHost: 127.0.0.1:9999\r\nConnection: keep-alive\r\nUser-Agent: test\r\n\r\n".to_vec();
+
+        let normalized = String::from_utf8(normalize_callback_request(request).unwrap()).unwrap();
+
+        assert!(normalized.starts_with("GET /callback?code=abc HTTP/1.1\r\n"));
+        assert!(normalized.contains("\r\nHost: 127.0.0.1:9999\r\n"));
+        assert!(normalized.contains("\r\nConnection: close\r\n"));
+        assert!(normalized.contains("\r\nUser-Agent: test\r\n"));
+        assert!(!normalized.contains("keep-alive"));
     }
 
     #[test]
@@ -918,6 +1835,73 @@ mod tests {
         })
         .unwrap();
         assert!(format_command(&spec).contains(",readonly"));
+    }
+
+    #[test]
+    fn linked_worktree_mounts_common_git_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_git = temp.path().join("main/.git");
+        let worktree = temp.path().join("feature");
+        let worktree_git = main_git.join("worktrees/feature");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: &worktree,
+            workspace: &worktree,
+            host_home: None,
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["true".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(&format!(
+            "type=bind,src={},dst={}",
+            main_git.display(),
+            main_git.display()
+        )));
+        assert!(!rendered.contains(&format!(
+            "type=bind,src={},dst={}",
+            worktree_git.display(),
+            worktree_git.display()
+        )));
+    }
+
+    #[test]
+    fn relative_worktree_gitdir_mounts_at_container_relative_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_git = temp.path().join("main/.git");
+        let worktree = temp.path().join("feature");
+        let worktree_git = main_git.join("worktrees/feature");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..").unwrap();
+        std::fs::write(
+            &worktree.join(".git"),
+            "gitdir: ../main/.git/worktrees/feature\n",
+        )
+        .unwrap();
+
+        let paths = linked_worktree_git_paths(&worktree, Path::new("/workspace"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(paths.git_dir, worktree_git);
+        assert_eq!(paths.git_target, Path::new("/main/.git/worktrees/feature"));
+        assert_eq!(paths.common_dir, main_git);
+        assert_eq!(paths.common_target, Path::new("/main/.git"));
     }
 
     #[test]
@@ -1261,10 +2245,184 @@ mod tests {
         assert!(!rendered.contains("agentbox-pnpm-cache"));
         assert!(rendered.contains("agentbox-codex-desktop"));
         assert!(rendered.contains("/agentbox/codex-desktop"));
+        assert!(!rendered.contains("agentbox-claude-desktop"));
+        assert!(!rendered.contains("/agentbox/claude-desktop"));
         assert!(!rendered.contains("agentbox-pip-cache"));
         assert!(rendered.contains("AGENTBOX_IMPORT_CREDENTIALS=codex"));
+        assert!(spec.gui_cache);
         assert!(spec.codex_desktop_cache);
+        assert!(!spec.claude_desktop_cache);
         assert_eq!(spec.imported_credentials.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn gui_credential_command_routes_by_desktop_app() {
+        let mut config = Config::default();
+        config.gui.enabled = true;
+
+        // Claude Desktop launchers import Claude credentials.
+        assert_eq!(
+            credential_command(&config, &["claude-desktop".into()]),
+            vec!["claude".to_string()]
+        );
+        assert_eq!(
+            credential_command(
+                &config,
+                &["/agentbox/claude-desktop/run-claude-desktop.sh".into()],
+            ),
+            vec!["claude".to_string()]
+        );
+
+        // Codex Desktop and other GUI commands default to Codex credentials.
+        assert_eq!(
+            credential_command(&config, &["codex-desktop".into()]),
+            vec!["codex".to_string()]
+        );
+        assert_eq!(
+            credential_command(&config, &["codex-login".into()]),
+            vec!["codex-login".to_string()],
+            "device-auth helper should persist auth in the container home"
+        );
+
+        // Disabling an import leaves the command untouched.
+        config.gui.import_claude_credentials = false;
+        assert_eq!(
+            credential_command(&config, &["claude-desktop".into()]),
+            vec!["claude-desktop".to_string()]
+        );
+    }
+
+    #[test]
+    fn desktop_launchers_select_agent_specific_runtime_setup() {
+        assert_eq!(
+            update_agent(&["codex-desktop".into()]),
+            Some("codex"),
+            "Codex Desktop should receive the same CLI update preflight as Codex"
+        );
+        assert_eq!(
+            update_agent(&["/agentbox/codex-desktop/run-codex-desktop.sh".into()]),
+            Some("codex")
+        );
+        assert_eq!(update_agent(&["codex-login".into()]), Some("codex"));
+        assert_eq!(update_agent(&["claude-desktop".into()]), None);
+    }
+
+    #[test]
+    fn claude_desktop_mounts_only_when_requested() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let x11_socket = temp.path().join(".X11-unix");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&x11_socket).unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.wayland = false;
+        config.gui.display = ":99".into();
+        config.gui.x11_socket = x11_socket;
+
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["claude-desktop".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains("agentbox-codex-desktop"));
+        assert!(rendered.contains("agentbox-claude-desktop"));
+        assert!(rendered.contains("/agentbox/claude-desktop"));
+        assert!(rendered.contains("AGENTBOX_IMPORT_CREDENTIALS=claude"));
+        assert!(spec.gui_cache);
+        assert!(spec.codex_desktop_cache);
+        assert!(spec.claude_desktop_cache);
+        assert_eq!(spec.imported_credentials.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn claude_desktop_prefers_x11_when_both_gui_backends_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let x11_socket = temp.path().join(".X11-unix");
+        let wayland_socket = temp.path().join("wayland-1");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&x11_socket).unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        std::fs::write(&wayland_socket, "").unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.display = ":0".into();
+        config.gui.x11_socket = x11_socket;
+        config.gui.wayland_display = "wayland-1".into();
+        config.gui.wayland_socket = wayland_socket.clone();
+
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["claude-desktop".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(&format!(
+            "src={},dst=/tmp/.X11-unix,readonly",
+            config.gui.x11_socket.display()
+        )));
+        assert!(rendered.contains("DISPLAY=:0"));
+        assert!(!rendered.contains("WAYLAND_DISPLAY=agentbox-wayland-1"));
+        assert!(!rendered.contains("CLAUDE_USE_WAYLAND=1"));
+        assert!(!rendered.contains("XDG_SESSION_TYPE=wayland"));
+        assert!(!rendered.contains("dst=/tmp/agentbox-wayland-1"));
+    }
+
+    #[test]
+    fn claude_desktop_uses_wayland_when_x11_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let wayland_socket = temp.path().join("wayland-1");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        std::fs::write(&wayland_socket, "").unwrap();
+        let mut config = Config::default();
+        config.gui.enabled = true;
+        config.gui.x11 = false;
+        config.gui.wayland_display = "wayland-1".into();
+        config.gui.wayland_socket = wayland_socket.clone();
+
+        let spec = build_run_spec(BuildInput {
+            config: &config,
+            repo_root: temp.path(),
+            workspace: temp.path(),
+            host_home: Some(&home),
+            compose: None,
+            environment: BTreeMap::new(),
+            command: vec!["claude-desktop".into()],
+            interactive: false,
+            session_id: None,
+        })
+        .unwrap();
+        let rendered = format_command(&spec);
+
+        assert!(rendered.contains(&format!(
+            "src={},dst=/tmp/agentbox-wayland-1,readonly",
+            wayland_socket.display()
+        )));
+        assert!(rendered.contains("WAYLAND_DISPLAY=agentbox-wayland-1"));
+        assert!(rendered.contains("CLAUDE_USE_WAYLAND=1"));
+        assert!(rendered.contains("XDG_SESSION_TYPE=wayland"));
+        assert!(!rendered.contains("dst=/tmp/.X11-unix"));
     }
 
     #[test]

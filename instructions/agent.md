@@ -12,6 +12,9 @@ remove the limitations below.
   files outside the repository.
 - The host home, credentials, SSH agent, Git config, and Docker socket are not
   mounted. Do not assume host tools or credentials exist.
+- Git is available for local commands against the mounted repository, including
+  linked worktrees. Do not assume Git remotes can authenticate from inside the
+  container.
 - Docker and Docker Compose may be unavailable, and an installed Docker CLI
   normally cannot reach the host daemon.
 - Project services (databases, Redis, APIs) may be reachable on the container
@@ -29,8 +32,8 @@ remove the limitations below.
 
 - Inspect the repository and its local instructions before making changes.
 - Keep changes scoped to the user's request and preserve unrelated work.
-- Do not commit, push, rebase, alter remotes, or change Git history; publishing
-  is a host-side responsibility.
+- Do not push, rebase, alter remotes, or change Git history; publishing is a
+  host-side responsibility.
 - Before running migrations, seeders, or other destructive commands against
   external services, confirm from configuration that the target is a local
   development service. If it is missing, ambiguous, or possibly shared or

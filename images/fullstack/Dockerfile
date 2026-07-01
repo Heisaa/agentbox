@@ -18,15 +18,24 @@ RUN apt-get update \
         git \
         jq \
         fonts-liberation \
+        icoutils \
+        imagemagick \
         libasound2 \
+        libegl1 \
+        libegl-mesa0 \
         libgbm1 \
+        libgl1 \
+        libgl1-mesa-dri \
+        libglx-mesa0 \
         libgtk-3-0 \
         libnotify4 \
         libnss3 \
+        libva2 \
         libx11-xcb1 \
         libxss1 \
         libxtst6 \
         libssl-dev \
+        p7zip-full \
         pkg-config \
         postgresql-client \
         python3 \
@@ -36,6 +45,10 @@ RUN apt-get update \
         socat \
         tini \
         unzip \
+        wget \
+        wmctrl \
+        x11-utils \
+        xdotool \
     && npm install --global pnpm@latest @anthropic-ai/claude-code @openai/codex \
     && ln -s /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
@@ -48,6 +61,10 @@ COPY --from=rust-toolchain /usr/local/cargo /usr/local/cargo
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 RUN for tool in cargo cargo-clippy cargo-fmt clippy-driver rust-analyzer rustc rustdoc rustfmt rustup; do \
         ln -s "/usr/local/cargo/bin/$tool" "/usr/local/bin/$tool"; \
+    done
+COPY --chmod=755 images/fullstack/host-browser-open.sh /usr/local/bin/agentbox-open
+RUN for tool in xdg-open open sensible-browser www-browser browser; do \
+        ln -s /usr/local/bin/agentbox-open "/usr/local/bin/$tool"; \
     done
 COPY --chmod=755 images/fullstack/entrypoint.sh /usr/local/bin/agentbox-entrypoint
 

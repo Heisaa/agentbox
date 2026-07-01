@@ -186,10 +186,12 @@ At startup, Agentbox imports credentials only for the agent being started when
 the standard host credential exists. Claude Code receives
 `~/.claude/.credentials.json` on Linux; on macOS, Agentbox falls back to the
 `Claude Code-credentials` Keychain entry. Codex receives `~/.codex/auth.json`.
-The host credential is staged read-only. A writable copy is created under the
-container's `/tmp` tmpfs and linked into the synthetic home, so refreshes do not
-modify the host credential and the credential copy disappears with the
-container. For Claude, Agentbox also imports only the theme from
+The host credential is staged read-only. By default, Agentbox uses it only to
+seed the synthetic container home when that home does not already have a
+credential. After that, signing in, refreshing, or signing out on the host does
+not overwrite the container's saved login; manage the container login from
+inside Agentbox or delete the credential in the Agentbox home to reseed it from
+the host. For Claude, Agentbox also imports only the theme from
 `~/.claude.json` and marks first-run onboarding complete; account metadata, MCP
 servers, project history, and other settings are excluded. Shells, custom
 agents, and the other built-in agent receive no credential.
@@ -206,8 +208,35 @@ agentbox run codex@personal -- --no-alt-screen
 Plain `agentbox run codex` still uses `~/.codex/auth.json`. Named account
 aliases may contain only letters, numbers, `.`, `_`, and `-`; selecting a named
 account that does not exist fails fast instead of silently launching unauthenticated.
-Each session gets its own container-local credential copy, so multiple Codex
-accounts can be active in separate Agentbox sessions at the same time.
+Selecting a named account explicitly reseeds Codex from that host account, even
+when the container already has another Codex login.
+
+## Host browser bridge
+
+Agentbox enables a host browser bridge by default so containerized agents can
+open sign-in links without mounting the host browser profile or graphical
+session. While the container is running, Agentbox starts a token-protected
+localhost opener on the host, points the container at it through
+`host.docker.internal`, and installs browser command shims on the container
+`PATH` for `xdg-open`, `open`, `sensible-browser`, `www-browser`, and
+`browser`. It also sets `BROWSER=/usr/local/bin/agentbox-open`.
+
+Only `http://` and `https://` URLs are forwarded. The bridge is available when
+the container has Docker networking and is skipped automatically with
+`network.mode = "none"`. When an auth URL contains a loopback callback such as
+`http://localhost:1455/callback`, Agentbox also opens the same port on the host
+for the lifetime of the session and forwards browser traffic back into the
+container's own `127.0.0.1:<port>` listener. This lets host-browser sign-ins
+complete without host networking or a Docker socket inside the container. Some
+providers can still reject loopback OAuth token exchange from a container; for
+Codex Desktop, use `agentbox run codex-login` to sign in with device auth when
+that happens.
+Disable it for a project with:
+
+```toml
+[host_browser]
+enabled = false
+```
 
 ## Codex Desktop GUI on Linux
 
@@ -231,10 +260,10 @@ through `XAUTHORITY` or `~/.Xauthority`, that single file is mounted read-only
 as `/tmp/agentbox-xauthority`.
 
 Codex Desktop normally needs the Codex CLI/auth state at runtime, so
-`gui.import_codex_credentials = true` by default. This imports the same staged,
-container-local copy of `~/.codex/auth.json` used by `agentbox run codex`, even
-when the command is a desktop launcher rather than the `codex` executable.
-Disable it for non-Codex GUI tools:
+`gui.import_codex_credentials = true` by default. This uses the same
+seed-if-missing behavior as `agentbox run codex`, even when the command is a
+desktop launcher rather than the `codex` executable. Disable it for non-Codex
+GUI tools:
 
 ```toml
 [gui]
@@ -261,23 +290,118 @@ per-run `codex-desktop` launcher on `PATH`:
 agentbox run codex-desktop
 ```
 
+If the host-browser OAuth callback reaches Codex but the token exchange is
+rejected, use Codex's device-auth flow instead. This avoids localhost browser
+callbacks and writes the resulting auth into the persistent Agentbox home used
+by Codex Desktop:
+
+```bash
+agentbox run codex-login
+agentbox run codex-desktop
+```
+
 The first GUI-enabled run can take several minutes because it clones
 `codex-desktop-linux`, downloads the upstream Codex DMG, and generates
 `codex-app/`. Later workspaces reuse the shared Docker volume. GUI runs also
 mount writable `agentbox-gui-cache` and `agentbox-gui-local` volumes at
-`/home/agent/.cache` and `/home/agent/.local` for desktop caches and state. To
-inspect or override the generated launcher path inside the container, use:
+`/home/agent/.cache` and `/home/agent/.local` for desktop caches and state.
+Codex Desktop runs also use the same best-effort Codex CLI update preflight as
+`agentbox run codex`. To inspect or override the generated launcher path inside
+the container, use:
 
 ```bash
 agentbox run /agentbox/codex-desktop/codex-desktop-linux/codex-app/start.sh
 ```
 
 Build failures print the last log lines and persist the complete log in the
-shared volume at `/agentbox/codex-desktop/install.log`.
+shared volume at `/agentbox/codex-desktop/install.log`. Runtime launcher
+failures print the tail of `~/.cache/codex-desktop/launcher.log` before the
+container exits.
 
 The standard full-stack image includes the common Electron runtime libraries
 and build tools needed by the Linux wrapper. If the app still reports missing
 system libraries, add them in `.agentbox/Dockerfile` and run `agentbox build`.
+
+## Claude Desktop GUI on Linux
+
+Agentbox can run Claude Desktop the same way it runs Codex Desktop, using
+[`aaddrick/claude-desktop-debian`](https://github.com/aaddrick/claude-desktop-debian)
+to repackage the official app into a Linux AppImage. The app and any agent
+process it spawns stay inside the Agentbox container while the window is visible
+on the host.
+
+It shares the same `[gui]` display passthrough described above, so enabling GUI
+support is enough:
+
+```toml
+[gui]
+enabled = true
+```
+
+Claude Desktop manages its own login through `~/.config/Claude`, which lives on
+the persistent container home, so it stays signed in across runs. Agentbox also
+seeds `~/.claude/.credentials.json` from the same host credential used by
+`agentbox run claude`, controlled by `gui.import_claude_credentials = true` by
+default. Disable it to skip that import:
+
+```toml
+[gui]
+enabled = true
+import_claude_credentials = false
+```
+
+With GUI passthrough enabled, `agentbox run claude-desktop` builds the AppImage
+on first use into a shared `agentbox-claude-desktop` Docker volume and exposes
+a per-run `claude-desktop` launcher on `PATH`:
+
+```bash
+agentbox run claude-desktop
+```
+
+The first run can take several minutes because it clones
+`claude-desktop-debian`, downloads the upstream installer and the Electron
+runtime, and builds the AppImage; later workspaces reuse the shared volume. The
+generated launcher runs the AppImage with `APPIMAGE_EXTRACT_AND_RUN=1` and
+`--no-sandbox` so it works without host FUSE or an Electron user-namespace
+sandbox. Build failures print the last log lines and persist the complete log in
+the shared volume at `/agentbox/claude-desktop/install.log`. Runtime starts
+print the tail of `~/.cache/claude-desktop-debian/launcher.log` after a short
+delay, and AppImage stdout/stderr is captured at
+`~/.cache/claude-desktop-debian/agentbox-launcher.log`. When the process stays
+alive but no window is visible, Agentbox also prints the X11 client list and
+Claude window matches if `x11-utils` is available. If Claude maps only a tiny
+placeholder X11 window, Agentbox resizes and raises it with `xdotool`; override
+the repair geometry with `AGENTBOX_CLAUDE_DESKTOP_WIDTH`,
+`AGENTBOX_CLAUDE_DESKTOP_HEIGHT`, `AGENTBOX_CLAUDE_DESKTOP_X`, and
+`AGENTBOX_CLAUDE_DESKTOP_Y`.
+
+The build needs network access to fetch the installer and Electron binary, plus
+the `p7zip-full`, `icoutils`, `imagemagick`, and `wget` packages that the
+standard full-stack image already includes. The image also includes `x11-utils`,
+`xdotool`, and `wmctrl` for GUI diagnostics and X11 window repair. If the app
+reports missing system libraries, add them in `.agentbox/Dockerfile` and run
+`agentbox build`.
+
+Claude Desktop follows the upstream launcher's default display backend in
+Agentbox. When both X11/XWayland and Wayland are available, Agentbox mounts X11
+by default because upstream keeps native Wayland opt-in on common desktop
+sessions until rendering is verified. If X11 is unavailable, Agentbox falls
+back to native Wayland and sets `CLAUDE_USE_WAYLAND=1`. Set
+`AGENTBOX_CLAUDE_DESKTOP_BACKEND=wayland` or `CLAUDE_USE_WAYLAND=1` explicitly
+to opt into native Wayland; set `AGENTBOX_CLAUDE_DESKTOP_BACKEND=x11` or
+`CLAUDE_USE_WAYLAND=0` to require X11/XWayland. Since Agentbox normally has no
+usable DRM device, the Claude launcher sets `LIBGL_ALWAYS_SOFTWARE=1`, requests
+Electron's SwiftShader GL path, disables DRI3 plus Chromium's GPU/Vulkan
+probing, and explicitly selects the X11 Ozone platform when running through
+X11/XWayland. It leaves the software rasterizer enabled. Set
+`AGENTBOX_CLAUDE_DESKTOP_DISABLE_GPU=0` to test the raw upstream rendering path,
+or `AGENTBOX_CLAUDE_DESKTOP_SOFTPIPE=1` to use Mesa's slower softpipe fallback
+if llvmpipe still cannot render. If you hit a Chromium GPU process crash, try
+the upstream recovery switch with
+`CLAUDE_DISABLE_GPU=1 agentbox run claude-desktop`. Run
+`agentbox run claude-desktop -- --doctor` for a diagnostics report; the full
+Electron log is written to
+`~/.cache/claude-desktop-debian/launcher.log` inside the container.
 
 `agentbox init` creates `.agentbox/config.toml`, an ignored local development
 environment file location, and an example env file. Edit `runtime.image` to use
@@ -373,12 +497,19 @@ it does not automatically import that variable.
 ## Security boundary
 
 The repository is intentionally writable, so the agent can alter or delete
-project files. Review changes and perform Git commits on the host. Agentbox
-does not mount the host home, SSH agent, general cloud configuration, Git
-configuration, package-manager credentials, or Docker socket. The read-only
-`/etc/localtime` system file is mounted to match the host timezone. Agentbox
-imports only the selected Claude Code or Codex credential file as described
-above.
+project files. The runtime image includes `git`, and Agentbox configures Git to
+trust only the mounted workspace path so local commands such as `git status`,
+`git diff`, and `git log` work inside the container. Linked worktrees are
+supported by mounting the repository Git metadata that the worktree's `.git`
+file points to. Review changes and perform publishing operations on the host.
+Agentbox does not mount the host home, SSH agent, general cloud configuration,
+global Git configuration, Git credentials, package-manager credentials, or
+Docker socket. The read-only `/etc/localtime` system file is mounted to match
+the host timezone. Agentbox imports only the selected Claude Code or Codex
+credential file as described above. The host browser bridge is token-protected
+and URL-only, but it does allow code in the container to ask the host browser to
+visit HTTP(S) URLs; set `host_browser.enabled = false` when that host
+interaction is not desired.
 
 GUI passthrough is disabled by default because X11 and Wayland sockets allow a
 containerized desktop app to interact with the user's graphical session. Enable

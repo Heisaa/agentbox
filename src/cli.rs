@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -310,6 +310,7 @@ fn run_agent(args: &RunArgs, explain: bool) -> Result<u8> {
         println!("\n{}", docker::format_command(&spec));
         Ok(0)
     } else {
+        ensure_gui_enabled_for_command(&mut context, &command)?;
         ensure_docker_available()?;
         build_runtime_image(&context)?;
         prepare_runtime_network(&mut context)?;
@@ -480,6 +481,55 @@ fn select_up_services(
     Ok((!services.is_empty()).then_some(services))
 }
 
+fn ensure_gui_enabled_for_command(context: &mut AppContext, command: &[String]) -> Result<()> {
+    let Some(launcher) = gui_launcher(command) else {
+        return Ok(());
+    };
+    if context.config.gui.enabled {
+        return Ok(());
+    }
+
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        anyhow::bail!(
+            "`agentbox run {launcher}` requires `gui.enabled = true` in {}; run it from an \
+             interactive terminal to enable GUI passthrough when prompted, or edit the config file",
+            crate::config::CONFIG_FILE
+        );
+    }
+
+    if !confirm_enable_gui(launcher)? {
+        anyhow::bail!(
+            "aborted; `agentbox run {launcher}` requires `gui.enabled = true` in {}",
+            crate::config::CONFIG_FILE
+        );
+    }
+
+    let update = Config::set_gui_enabled(&context.repo_root, true)?;
+    context.config.gui.enabled = true;
+    println!(
+        "Updated {}: set gui.enabled = true",
+        relative(&context.repo_root, &update.path)
+    );
+    Ok(())
+}
+
+fn confirm_enable_gui(launcher: &str) -> Result<bool> {
+    print!(
+        "`agentbox run {launcher}` needs GUI passthrough, which exposes host display sockets to \
+         the container. Enable gui.enabled now? [y/N] "
+    );
+    io::stdout().flush().context("failed to flush prompt")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read prompt response")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn build_spec(
     context: &AppContext,
     allowed_secrets: &[String],
@@ -557,17 +607,27 @@ fn validate_container_command_path(
 }
 
 fn validate_gui_command(config: &Config, command: &[String]) -> Result<()> {
-    if command
-        .first()
-        .is_some_and(|command| command == "codex-desktop")
+    if let Some(launcher) = gui_launcher(command)
         && !config.gui.enabled
     {
         anyhow::bail!(
-            "`agentbox run codex-desktop` requires `gui.enabled = true` in {}",
+            "`agentbox run {launcher}` requires `gui.enabled = true` in {}",
             crate::config::CONFIG_FILE
         );
     }
     Ok(())
+}
+
+fn gui_launcher(command: &[String]) -> Option<&str> {
+    let launcher = command.first()?.as_str();
+    command_requests_gui(launcher).then_some(launcher)
+}
+
+fn command_requests_gui(command: &str) -> bool {
+    command == "codex-desktop"
+        || command == "claude-desktop"
+        || command.contains("codex-desktop")
+        || command.contains("claude-desktop")
 }
 
 fn agent_command(config: &Config, args: &RunArgs, tools: &ProjectTools) -> Result<Vec<String>> {
@@ -692,7 +752,7 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
         "- Host agent credentials: {}",
         spec.imported_credentials
             .as_deref()
-            .map(|agent| format!("{agent} (read-only source, container-local copy)"))
+            .map(|agent| format!("{agent} (read-only seed if container login is missing)"))
             .unwrap_or_else(|| "none".into())
     );
     println!(
@@ -731,6 +791,16 @@ fn print_banner(context: &AppContext, spec: &RunSpec) {
             enabled_gui_backends(&context.config)
         } else {
             "disabled".into()
+        }
+    );
+    println!(
+        "- Host browser bridge: {}",
+        if spec.host_browser {
+            "enabled"
+        } else if context.config.host_browser.enabled {
+            "unavailable"
+        } else {
+            "disabled"
         }
     );
     println!(
@@ -1203,6 +1273,18 @@ mod tests {
             .unwrap_err()
             .to_string();
 
+        assert!(error.contains("gui.enabled = true"));
+    }
+
+    #[test]
+    fn claude_desktop_command_requires_gui_config() {
+        let config = Config::default();
+
+        let error = validate_gui_command(&config, &["claude-desktop".into()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("claude-desktop"));
         assert!(error.contains("gui.enabled = true"));
     }
 }

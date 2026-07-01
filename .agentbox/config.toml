@@ -28,6 +28,7 @@ NODE_ENV = "development"
 [gui]
 display = ""
 enabled = true
+import_claude_credentials = true
 import_codex_credentials = true
 wayland = true
 wayland_display = ""
@@ -40,6 +41,9 @@ xauthority = ""
 enabled = false
 service = "headroom"
 url = "http://headroom:8787"
+
+[host_browser]
+enabled = true
 
 [limits]
 cpus = 4.0

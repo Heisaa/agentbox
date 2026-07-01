@@ -38,6 +38,11 @@ pub struct RuntimeImageUpdate {
     pub dockerfile: PathBuf,
 }
 
+#[derive(Debug)]
+pub struct ConfigValueUpdate {
+    pub path: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -45,6 +50,7 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
     pub caveman: CavemanConfig,
+    pub host_browser: HostBrowserConfig,
     pub gui: GuiConfig,
     pub headroom: HeadroomConfig,
     pub security: SecurityConfig,
@@ -80,9 +86,16 @@ pub struct CavemanConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct HostBrowserConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GuiConfig {
     pub enabled: bool,
     pub import_codex_credentials: bool,
+    pub import_claude_credentials: bool,
     pub x11: bool,
     pub wayland: bool,
     pub display: String,
@@ -197,6 +210,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             agent: AgentConfig::default(),
             caveman: CavemanConfig::default(),
+            host_browser: HostBrowserConfig::default(),
             gui: GuiConfig::default(),
             headroom: HeadroomConfig::default(),
             security: SecurityConfig::default(),
@@ -238,11 +252,18 @@ impl Default for CavemanConfig {
     }
 }
 
+impl Default for HostBrowserConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 impl Default for GuiConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             import_codex_credentials: true,
+            import_claude_credentials: true,
             x11: true,
             wayland: true,
             display: String::new(),
@@ -455,6 +476,36 @@ impl Config {
             dockerfile: repo_root.join(dockerfile),
         })
     }
+
+    pub fn set_gui_enabled(repo_root: &Path, enabled: bool) -> Result<ConfigValueUpdate> {
+        let path = repo_root.join(CONFIG_FILE);
+        if !path.exists() {
+            let mut config = Self::default();
+            config.gui.enabled = enabled;
+            return Ok(ConfigValueUpdate {
+                path: config.write_new(repo_root)?,
+            });
+        }
+
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let mut actual: toml::Value =
+            toml::from_str(&contents).with_context(|| format!("invalid {}", path.display()))?;
+        let table = actual
+            .as_table_mut()
+            .context("agentbox config must contain a TOML table")?;
+        let gui = table
+            .entry("gui")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .context("gui config must be a TOML table")?;
+        gui.insert("enabled".into(), toml::Value::Boolean(enabled));
+
+        let updated = toml::to_string_pretty(&actual).context("failed to serialize config")?;
+        fs::write(&path, updated).with_context(|| format!("failed to write {}", path.display()))?;
+
+        Ok(ConfigValueUpdate { path })
+    }
 }
 
 fn merge_missing(
@@ -590,8 +641,10 @@ mod tests {
         assert!(!decoded.security.mount_host_home);
         assert!(!decoded.caveman.enabled);
         assert_eq!(decoded.caveman.level, CavemanLevel::Full);
+        assert!(decoded.host_browser.enabled);
         assert!(!decoded.gui.enabled);
         assert!(decoded.gui.import_codex_credentials);
+        assert!(decoded.gui.import_claude_credentials);
         assert!(decoded.gui.x11);
         assert!(decoded.gui.wayland);
         assert_eq!(decoded.gui.x11_socket, Path::new("/tmp/.X11-unix"));
@@ -706,9 +759,11 @@ mod tests {
         assert!(raw.get("project").is_none());
         assert_eq!(raw["env"]["defaults"]["CUSTOM_VALUE"].as_str(), Some("yes"));
         assert!(raw["caveman"].is_table());
+        assert!(raw["host_browser"].is_table());
         assert!(raw["gui"].is_table());
         assert!(raw["headroom"].is_table());
         assert!(update.added.contains(&"caveman".into()));
+        assert!(update.added.contains(&"host_browser".into()));
         assert!(update.added.contains(&"gui".into()));
         assert!(update.removed.contains(&"agent.allow_network".into()));
         assert_eq!(
@@ -751,5 +806,34 @@ mod tests {
             Some(".agentbox/Dockerfile")
         );
         assert_eq!(raw["runtime"]["build_context"].as_str(), Some("."));
+    }
+
+    #[test]
+    fn enabling_gui_preserves_unknown_config() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(CONFIG_DIR)).unwrap();
+        fs::write(
+            temp.path().join(CONFIG_FILE),
+            "version = 1\ncustom = \"keep\"\n",
+        )
+        .unwrap();
+
+        let update = Config::set_gui_enabled(temp.path(), true).unwrap();
+        let raw: toml::Value = toml::from_str(&fs::read_to_string(&update.path).unwrap()).unwrap();
+
+        assert_eq!(raw["custom"].as_str(), Some("keep"));
+        assert_eq!(raw["gui"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn enabling_gui_creates_missing_config() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let update = Config::set_gui_enabled(temp.path(), true).unwrap();
+        let raw: toml::Value = toml::from_str(&fs::read_to_string(&update.path).unwrap()).unwrap();
+
+        assert_eq!(update.path, temp.path().join(CONFIG_FILE));
+        assert_eq!(raw["gui"]["enabled"].as_bool(), Some(true));
+        assert_eq!(raw["version"].as_integer(), Some(1));
     }
 }
